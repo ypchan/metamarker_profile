@@ -338,6 +338,42 @@ S1	16S	Bacteria	genus	Vibrio	20	1000000	20
 | Other analyses | `scripts/taxa_time_rank_spacetime.R` | target taxa dynamics, rank diversity, time/space composition | long-table summaries, Shannon/Simpson by rank |
 | Other analyses | `scripts/disturbance_event_response.R` | event PERMANOVA, environment response tests, focal-taxon models, lagged microbe screens | longitudinal event screening with site/time adjustment |
 
+### Figure Style
+
+All R templates use the same plotting style from `scripts/analysis_common.R`. The defaults are intentionally close to common Nature-family figure conventions:
+
+- white background with no decorative grid
+- thin black axes and ticks
+- compact sans-serif text
+- restrained color-blind-aware palette based on Okabe-Ito-style colors
+- PDF and 320-dpi PNG output by default
+- consistent output folders and file names for multi-panel figure assembly
+
+The scripts produce analysis-ready figures, but final journal figures may still need panel lettering, exact physical sizing, and small manual adjustments in Illustrator, Inkscape, PowerPoint, or R.
+
+### Statistical Defaults And Limitations
+
+These templates prioritize defensible defaults over speed or decorative plots. They are suitable starting points for publication-grade analysis, but they do not replace study-design review, biological interpretation, or sensitivity analysis.
+
+| Template | Default methods | Key parameters | Main limitations |
+| --- | --- | --- | --- |
+| `diversity_alpha_beta.R` | Observed richness, Shannon, Simpson, inverse Simpson, Pielou; Bray-Curtis PCoA; PERMANOVA with `vegan::adonis2`; beta dispersion with `betadisper` | `distance = "bray"`, `normalize = "relative"`, `permutations = 9999`, `min-prevalence = 0.10` | PERMANOVA can be significant because of dispersion differences, so inspect `beta_dispersion_*`. Bray-Curtis is abundance-sensitive and does not model compositional uncertainty. Rarefaction is not performed by default. |
+| `differential_abundance_compositional.R` | Relative abundance followed by CLR transform; per-feature linear models; optional covariates; BH-FDR | `pseudocount = 1e-06`, `min-prevalence = 0.10`, `alpha = 0.05` | CLR models require enough samples per group and sensible pseudocount choice. Strong zero inflation, batch effects, and unbalanced designs need sensitivity checks. This is not a replacement for ANCOM-BC2, ALDEx2, MaAsLin2, or DESeq2 when those are required by a study. |
+| `biomarker_discovery_nonparametric.R` | Kruskal-Wallis screening; pairwise Wilcoxon tests; BH-FDR; enriched-group log2 fold change | `alpha = 0.05`, `min-abs-log2fc = 1`, `min-prevalence = 0.10` | Nonparametric tests do not adjust for covariates in this template. Biomarker calls are association markers, not mechanistic proof. |
+| `network_association_analysis.R` | CLR transform; pairwise Spearman correlation; global BH-FDR; edge filtering by FDR and absolute correlation; optional igraph layout | `transform = "clr"`, `cor-method = "spearman"`, `min-prevalence = 0.20`, `top-n = 100`, `min-abs-cor = 0.60`, `alpha = 0.05` | Correlation networks are not causal networks. Compositional data can induce indirect correlations. Results depend strongly on prevalence filtering, transformation, and sample size. Use networks as hypotheses, not proof. |
+| `functional_profile_analysis.R` | Top function summaries; Bray-Curtis PCoA; PERMANOVA; CLR linear models for group contrasts | `permutations = 9999`, `min-prevalence = 0.10`, `pseudocount = 1e-06` | Functional prediction accuracy depends on the external tool and database. This script analyzes predicted tables; it does not infer functions from reads. Treat unvalidated predictions cautiously. |
+| `taxa_time_rank_spacetime.R` | Target-taxon summaries; Shannon/Simpson by rank; top-taxon composition across time/space/group | `target-rank = "genus"`, `top-n = 20` | Primarily descriptive. It does not model temporal autocorrelation or repeated measures. Use mixed models or time-series models for formal inference when needed. |
+| `disturbance_event_response.R` | Bray-Curtis PERMANOVA with site strata; event effects on environmental variables; focal-taxon linear models; PCoA-axis driver screening; lagged focal-microbe association screen | `permutations = 9999`, `min-prevalence = 0.10`, `top-n = 100`, `pseudocount = 1e-06` | This is evidence screening, not causal proof. Event, environment, focal fungi, bacteria, and archaea may be confounded by time, site, season, and unmeasured drivers. Lagged associations require enough repeated time points per site; small time series are unstable. |
+
+Recommended reporting:
+
+- report sample size per group/site/time point
+- report feature filtering thresholds
+- report distance metric, transformation, pseudocount, and permutation count
+- report FDR method as Benjamini-Hochberg
+- for PERMANOVA, report whether dispersion tests were checked
+- for disturbance analysis, avoid causal wording unless supported by experimental design or external evidence
+
 ### Diversity Template
 
 Open `scripts/diversity_alpha_beta.R` and edit:

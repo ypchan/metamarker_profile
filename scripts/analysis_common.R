@@ -138,24 +138,32 @@ mc_feature_annotation <- function(features) {
   out
 }
 
-mc_theme <- function(base_size = 11) {
-  ggplot2::theme_bw(base_size = base_size) +
+mc_theme <- function(base_size = 9) {
+  ggplot2::theme_classic(base_size = base_size, base_family = "sans") +
     ggplot2::theme(
       panel.grid.minor = ggplot2::element_blank(),
-      panel.grid.major = ggplot2::element_line(linewidth = 0.2, colour = "grey88"),
-      axis.text = ggplot2::element_text(colour = "grey20"),
-      axis.title = ggplot2::element_text(colour = "grey10"),
-      plot.title = ggplot2::element_text(face = "bold", hjust = 0),
-      legend.title = ggplot2::element_text(face = "bold"),
-      strip.background = ggplot2::element_rect(fill = "grey92", colour = "grey70"),
-      strip.text = ggplot2::element_text(face = "bold")
+      panel.grid.major = ggplot2::element_blank(),
+      panel.background = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      axis.line = ggplot2::element_line(linewidth = 0.35, colour = "black"),
+      axis.ticks = ggplot2::element_line(linewidth = 0.30, colour = "black"),
+      axis.ticks.length = grid::unit(2, "pt"),
+      axis.text = ggplot2::element_text(colour = "black", size = base_size * 0.9),
+      axis.title = ggplot2::element_text(colour = "black", size = base_size),
+      plot.title = ggplot2::element_text(face = "plain", hjust = 0, size = base_size * 1.05),
+      legend.title = ggplot2::element_text(face = "plain", size = base_size * 0.9),
+      legend.text = ggplot2::element_text(size = base_size * 0.85),
+      legend.key = ggplot2::element_rect(fill = "white", colour = NA),
+      strip.background = ggplot2::element_blank(),
+      strip.text = ggplot2::element_text(face = "plain", colour = "black", size = base_size * 0.9)
     )
 }
 
 mc_palette <- function(n) {
-  base <- c("#3B6FB6", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
-            "#7F3C8D", "#11A579", "#3969AC", "#F2B701", "#E73F74", "#80BA5A")
-  if (n <= length(base)) base[seq_len(n)] else grDevices::hcl.colors(n, palette = "Dark 3")
+  base <- c("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9",
+            "#000000", "#999999", "#332288", "#88CCEE", "#44AA99", "#AA4499",
+            "#882255", "#DDCC77", "#117733")
+  if (n <= length(base)) base[seq_len(n)] else grDevices::hcl.colors(n, palette = "Dark 3", rev = FALSE)
 }
 
 mc_save_plot <- function(plot, file_base, width = 7, height = 5, formats = "both", dpi = 320) {
