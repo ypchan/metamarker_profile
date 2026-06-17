@@ -1,0 +1,26 @@
+.DS_Store
+*.log
+*.tmp
+*.pyc
+__pycache__/
+.agents/
+.codex/
+
+# Local environments
+.venv/
+.env
+
+# Pipeline outputs
+marker_count_out/
+
+# Large downloaded/generated references
+ref/
+*.mmi
+*.fasta
+*.fa
+*.fna
+*.fasta.gz
+*.fa.gz
+*.fna.gz
+*.taxonomy.tsv
+ref_taxonomy.tsv

@@ -1,0 +1,16 @@
+name: meta-marker-count
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.9
+  - bash
+  - coreutils
+  - findutils
+  - gawk
+  - grep
+  - gzip
+  - sed
+  - seqkit
+  - bbmap
+  - minimap2
