@@ -203,7 +203,8 @@ def taxonomy_candidate(header: str) -> str:
     desc = split_header_description(header)
     if desc:
         candidates.append(desc)
-    candidates.extend(part.strip() for part in header.split("|") if part.strip())
+    if "|" in header:
+        candidates.extend(part.strip() for part in header.split("|") if part.strip())
 
     scored: list[tuple[int, int, str]] = []
     for cand in candidates:
@@ -214,6 +215,11 @@ def taxonomy_candidate(header: str) -> str:
     if scored and scored[0][0] > 0:
         return scored[0][2]
     return desc
+
+
+def taxonomy_parts(header: str) -> list[str]:
+    cand = taxonomy_candidate(header)
+    return [p.strip() for p in cand.strip().strip(";").split(";") if p.strip()]
 
 
 def detect_rank(raw: str) -> tuple[str | None, str]:
@@ -246,8 +252,7 @@ def clean_taxon(raw: str) -> str:
 
 
 def parse_taxonomy(header: str, default_domain: str = MISSING) -> Taxonomy:
-    cand = taxonomy_candidate(header)
-    parts = [p.strip() for p in cand.strip().strip(";").split(";") if p.strip()]
+    parts = taxonomy_parts(header)
     ranks: dict[str, str] = {}
     sequential: list[str] = []
 
@@ -278,6 +283,52 @@ def parse_taxonomy(header: str, default_domain: str = MISSING) -> Taxonomy:
         genus=values["genus"],
         species=values["species"],
     )
+
+
+def taxonomy_from_values(values: dict[str, str]) -> Taxonomy:
+    return Taxonomy(
+        domain=values.get("domain", MISSING),
+        phylum=values.get("phylum", MISSING),
+        klass=values.get("class", MISSING),
+        order=values.get("order", MISSING),
+        family=values.get("family", MISSING),
+        genus=values.get("genus", MISSING),
+        species=values.get("species", MISSING),
+    )
+
+
+def parse_silva_taxonomy(header: str) -> Taxonomy:
+    raw_parts = taxonomy_parts(header)
+    parts = [clean_taxon(part) for part in raw_parts]
+    if not parts:
+        return parse_taxonomy(header)
+
+    dkey = domain_key(parts[0])
+    values = {rank: MISSING for rank in RANKS}
+    values["domain"] = parts[0]
+
+    if dkey in {"bacteria", "archaea"}:
+        for rank, value in zip(RANKS, parts):
+            values[rank] = value
+        return taxonomy_from_values(values)
+
+    if dkey == "eukaryota":
+        lineage = parts[1:]
+        upper = lineage[:-2] if len(lineage) >= 2 else lineage
+        for rank, value in zip(["phylum", "class", "order", "family"], upper):
+            values[rank] = value
+        if len(lineage) >= 2:
+            values["genus"] = lineage[-2]
+            values["species"] = lineage[-1]
+        elif len(lineage) == 1:
+            values["species"] = lineage[0]
+        return taxonomy_from_values(values)
+
+    return parse_taxonomy(header)
+
+
+def has_silva_organelle_lineage(header: str) -> bool:
+    return any(part.strip() in {"Mitochondria", "Chloroplast"} for part in taxonomy_parts(header))
 
 
 def domain_key(domain: str) -> str:
@@ -331,6 +382,7 @@ def process_silva(
     outdir: Path,
     id_registry: IdRegistry,
     force: bool,
+    keep_organelles: bool,
 ) -> list[RefTaxonomy]:
     base = strip_fasta_suffix(fasta)
     arc_bac_fasta = outdir / f"{base}.dna.arc_bac.shortid.fasta"
@@ -341,7 +393,7 @@ def process_silva(
         ensure_can_write(path, force)
 
     records: list[RefTaxonomy] = []
-    counts = {"arc_bac": 0, "euk": 0, "skipped": 0}
+    counts = {"arc_bac": 0, "euk": 0, "organelle": 0, "skipped": 0}
     with arc_bac_fasta.open("wt", encoding="utf-8") as ab_fa, arc_bac_tax.open(
         "wt", encoding="utf-8"
     ) as ab_tax, euk_fasta.open("wt", encoding="utf-8") as euk_fa, euk_tax.open(
@@ -350,7 +402,10 @@ def process_silva(
         write_tax_header(ab_tax)
         write_tax_header(eu_tax)
         for header, seq in read_fasta(fasta):
-            tax = parse_taxonomy(header)
+            if not keep_organelles and has_silva_organelle_lineage(header):
+                counts["organelle"] += 1
+                continue
+            tax = parse_silva_taxonomy(header)
             dkey = domain_key(tax.domain)
             if dkey in {"bacteria", "archaea"}:
                 ref_id = id_registry.unique(short_id_from_header(header))
@@ -377,6 +432,8 @@ def process_silva(
     log(f"  taxonomy: {euk_tax}")
     if counts["skipped"]:
         log(f"SILVA records skipped because domain was not Bacteria/Archaea/Eukaryota: {counts['skipped']}")
+    if counts["organelle"]:
+        log(f"SILVA organelle records skipped by exact lineage item Mitochondria/Chloroplast: {counts['organelle']}")
     return records
 
 
@@ -427,6 +484,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only write per-database FASTA/taxonomy files.",
     )
     parser.add_argument(
+        "--keep-organelles",
+        action="store_true",
+        help="Keep SILVA records with exact lineage item Mitochondria or Chloroplast. Default skips them.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing output files.",
@@ -449,7 +511,15 @@ def main(argv: list[str] | None = None) -> int:
     all_records: list[RefTaxonomy] = []
 
     if args.silva:
-        all_records.extend(process_silva(args.silva, args.outdir, id_registry, args.force))
+        all_records.extend(
+            process_silva(
+                args.silva,
+                args.outdir,
+                id_registry,
+                args.force,
+                keep_organelles=args.keep_organelles,
+            )
+        )
     if args.unite:
         all_records.extend(
             process_unite(

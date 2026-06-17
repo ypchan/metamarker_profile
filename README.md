@@ -116,8 +116,8 @@ meta_marker_count \
   --sample-id 202311_MF1_00-10 \
   --r1 /data/202311_MF1_00-10_R1.fq.gz \
   --r2 /data/202311_MF1_00-10_R2.fq.gz \
-  --ref-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta \
-  --index-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta.mmi \
+  --ref-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta \
+  --index-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta.mmi \
   --ref-its ref/UNITE_public_19.02.2025.shortid.fasta \
   --index-its ref/UNITE_public_19.02.2025.shortid.fasta.mmi \
   --taxonomy ref/ref_taxonomy.tsv
@@ -139,8 +139,47 @@ meta_marker_count \
 
 ```text
 UNITE_public_19.02.2025.fasta.gz
-SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz
+SILVA_138.2_SSURef_tax_silva.fasta.gz
 ```
+
+SILVA SSU 可以直接下载：
+
+```bash
+curl -L \
+  -o SILVA_138.2_SSURef_tax_silva.fasta.gz \
+  "https://www.arb-silva.de/fileadmin/silva_databases/current/Exports/SILVA_138.2_SSURef_tax_silva.fasta.gz"
+```
+
+UNITE ITS 从网页下载：
+
+```text
+https://unite.ut.ee/repository.php
+```
+
+进入网页后下载对应 public release 的 FASTA gzip 文件，并放到工作目录中，例如：
+
+```text
+UNITE_public_19.02.2025.fasta.gz
+```
+
+如果使用其他 SILVA/UNITE 文件名也可以，生成文件的前缀会跟随输入文件名。
+
+UNITE ITS header 格式示例：
+
+```text
+>UDB016649|k__Fungi;p__Basidiomycota;c__Agaricomycetes;o__Thelephorales;f__Thelephoraceae;g__Thelephora;s__Thelephora_albomarginata|SH1281904.10FU
+```
+
+脚本使用第一个 `|` 前面的 ID 作为 short ID，也就是 `UDB016649`；中间的 `k__/p__/c__/o__/f__/g__/s__` lineage 写入 taxonomy。
+
+SILVA SSU header 格式示例：
+
+```text
+>AB000393.1.1510 Bacteria;Pseudomonadota;Gammaproteobacteria;Enterobacterales;Vibrionaceae;Vibrio;Vibrio halioticoli
+>AY846379.1.1791 Eukaryota;Archaeplastida;Chloroplastida;Chlorophyta;Chlorophyceae;Sphaeropleales;Monoraphidium;Monoraphidium sp. Itas 9/21 14-6w
+```
+
+脚本使用空格前的 accession/range 作为 short ID，例如 `AB000393.1.1510`。SILVA 中 `Bacteria`/`Archaea` 作为 16S，`Eukaryota` 作为 18S。
 
 ### 一次性生成 SILVA + UNITE 参考文件
 
@@ -150,7 +189,7 @@ SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz
 mkdir -p ref
 
 python3 scripts/build_ref_files.py \
-  --silva SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  --silva SILVA_138.2_SSURef_tax_silva.fasta.gz \
   --unite UNITE_public_19.02.2025.fasta.gz \
   --outdir ref \
   --force
@@ -160,7 +199,7 @@ python3 scripts/build_ref_files.py \
 
 ```bash
 meta_marker_build_refs \
-  --silva SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  --silva SILVA_138.2_SSURef_tax_silva.fasta.gz \
   --unite UNITE_public_19.02.2025.fasta.gz \
   --outdir ref \
   --force
@@ -172,11 +211,11 @@ meta_marker_build_refs \
 ref/UNITE_public_19.02.2025.shortid.fasta
 ref/UNITE_public_19.02.2025.taxonomy.tsv
 
-ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta
-ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.taxonomy.tsv
+ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta
+ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.taxonomy.tsv
 
-ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta
-ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.taxonomy.tsv
+ref/SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta
+ref/SILVA_138.2_SSURef_tax_silva.dna.euk.taxonomy.tsv
 
 ref/ref_taxonomy.tsv
 ```
@@ -184,9 +223,9 @@ ref/ref_taxonomy.tsv
 含义：
 
 - `UNITE_public_19.02.2025.fasta.gz -> UNITE_public_19.02.2025.shortid.fasta + UNITE_public_19.02.2025.taxonomy.tsv`
-- `SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz -> SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta + SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.taxonomy.tsv`
-- `SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz -> SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta + SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.taxonomy.tsv`
-- `SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz + UNITE_public_19.02.2025.fasta.gz -> ref_taxonomy.tsv`
+- `SILVA_138.2_SSURef_tax_silva.fasta.gz -> SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta + SILVA_138.2_SSURef_tax_silva.dna.arc_bac.taxonomy.tsv`
+- `SILVA_138.2_SSURef_tax_silva.fasta.gz -> SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta + SILVA_138.2_SSURef_tax_silva.dna.euk.taxonomy.tsv`
+- `SILVA_138.2_SSURef_tax_silva.fasta.gz + UNITE_public_19.02.2025.fasta.gz -> ref_taxonomy.tsv`
 
 `ref_taxonomy.tsv` 格式：
 
@@ -199,6 +238,9 @@ AB000393.1.1510	16S	Bacteria	Pseudomonadota	Gammaproteobacteria	Enterobacterales
 
 - SILVA 中 `Bacteria` 和 `Archaea` 被写入 `.dna.arc_bac.*`，marker 标记为 `16S`。
 - SILVA 中 `Eukaryota` 被写入 `.dna.euk.*`，marker 标记为 `18S`。
+- SILVA 真核 lineage 可能超过 7 级；脚本保留最后两级作为 `genus` 和 `species`，避免真核 genus 错位。
+- SILVA 中独立 lineage 项精确等于 `Mitochondria` 或 `Chloroplast` 的记录按细胞器识别，并默认跳过。`Chloroplastida` 这类真核分类名不会被误判为 `Chloroplast`。
+- 如果确实需要保留细胞器记录，生成参考库时添加 `--keep-organelles`。
 - UNITE 被写入 `.shortid.*`，marker 标记为 `ITS`。
 - FASTA header 会被改成短 ID，并与 taxonomy 表的 `ref_id` 保持一致。
 - 如果不同记录产生重复短 ID，后续重复项会自动加数字后缀，避免 `ref_taxonomy.tsv` 中重复 `ref_id` 覆盖。
@@ -218,7 +260,7 @@ meta_marker_build_refs \
 
 ```bash
 meta_marker_build_refs \
-  --silva SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  --silva SILVA_138.2_SSURef_tax_silva.fasta.gz \
   --outdir ref \
   --force
 ```
@@ -227,7 +269,7 @@ meta_marker_build_refs \
 
 ```bash
 meta_marker_build_refs \
-  --silva SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  --silva SILVA_138.2_SSURef_tax_silva.fasta.gz \
   --unite UNITE_public_19.02.2025.fasta.gz \
   --outdir ref \
   --skip-combined \
@@ -239,11 +281,11 @@ meta_marker_build_refs \
 主流程的 `--index-16s/--index-18s/--index-its` 需要 minimap2 index。用生成的 short-id FASTA 建索引：
 
 ```bash
-minimap2 -d ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta.mmi \
-  ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta
+minimap2 -d ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta.mmi \
+  ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta
 
-minimap2 -d ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta.mmi \
-  ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta
+minimap2 -d ref/SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta.mmi \
+  ref/SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta
 
 minimap2 -d ref/UNITE_public_19.02.2025.shortid.fasta.mmi \
   ref/UNITE_public_19.02.2025.shortid.fasta
@@ -260,8 +302,8 @@ meta_marker_count \
   --input data_path.tsv \
   --outdir marker_count_out \
   --markers 16S,ITS \
-  --ref-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta \
-  --index-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta.mmi \
+  --ref-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta \
+  --index-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta.mmi \
   --ref-its ref/UNITE_public_19.02.2025.shortid.fasta \
   --index-its ref/UNITE_public_19.02.2025.shortid.fasta.mmi \
   --taxonomy ref/ref_taxonomy.tsv \
@@ -277,10 +319,10 @@ meta_marker_count \
   --input data_path.tsv \
   --outdir marker_count_out \
   --markers 16S,18S,ITS \
-  --ref-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta \
-  --index-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta.mmi \
-  --ref-18s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta \
-  --index-18s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.euk.shortid.fasta.mmi \
+  --ref-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta \
+  --index-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta.mmi \
+  --ref-18s ref/SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta \
+  --index-18s ref/SILVA_138.2_SSURef_tax_silva.dna.euk.shortid.fasta.mmi \
   --ref-its ref/UNITE_public_19.02.2025.shortid.fasta \
   --index-its ref/UNITE_public_19.02.2025.shortid.fasta.mmi \
   --taxonomy ref/ref_taxonomy.tsv \
@@ -298,8 +340,8 @@ meta_marker_count \
   --input data_path.tsv \
   --outdir marker_count_out \
   --markers 16S,ITS \
-  --ref-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta \
-  --index-16s ref/SILVA_138.2_SSURef_NR99_tax_silva.dna.arc_bac.shortid.fasta.mmi \
+  --ref-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta \
+  --index-16s ref/SILVA_138.2_SSURef_tax_silva.dna.arc_bac.shortid.fasta.mmi \
   --ref-its ref/UNITE_public_19.02.2025.shortid.fasta \
   --index-its ref/UNITE_public_19.02.2025.shortid.fasta.mmi \
   --taxonomy ref/ref_taxonomy.tsv \
