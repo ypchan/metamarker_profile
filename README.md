@@ -266,6 +266,222 @@ Important result tables:
 - `marker_rpm.<rank>.domain_total.tsv`: total marker reads/RPM per domain and marker.
 - `marker_rpm.<rank>.assignment_stats.tsv`: alignment filtering and ambiguity statistics.
 
+## R Analysis Scripts
+
+The scripts in `scripts/` are RStudio templates, not command-line tools. Open a script in RStudio, edit the `MC_CONFIG <- list(...)` block near the top, then click **Source** or run the whole file.
+
+Use the repository root as the RStudio working directory so relative paths such as `marker_count_out/...` resolve predictably.
+
+Each template writes the same output layout:
+
+```text
+OUTDIR/
+  tables/
+  figures/
+  logs/
+```
+
+Figures use the shared theme and palette from `scripts/analysis_common.R` and are saved as PDF and PNG by default. Set `fig-format = "none"` inside `MC_CONFIG` when only tables are needed.
+
+### R Dependencies
+
+The conda environment includes the required R packages:
+
+```bash
+mamba env update -f environment.yml
+```
+
+For a Windows R/RStudio installation, install the required CRAN packages in RStudio:
+
+```r
+install.packages(c("ggplot2", "vegan", "igraph"))
+```
+
+`igraph` is optional for the network layout figure; edge/node tables are still produced without it.
+
+### Input Formats For R Templates
+
+Most templates accept `sample_rows` input, matching `meta_marker_count` matrix output:
+
+```tsv
+sample_id	year	month	depth	Bacteria|16S|genus__Vibrio	Fungi|ITS|genus__Fusarium
+S1	2023	11	00-10	12.5	3.2
+S2	2023	11	10-20	0.0	8.1
+```
+
+Set non-feature columns in `metadata-cols`, for example `"year,month,depth,site_type"`.
+
+Functional prediction tables often use `feature_rows`:
+
+```tsv
+function_id	S1	S2	S3
+PWY-1234	10	4	8
+PWY-5678	0	9	3
+```
+
+Long abundance tables are used by the time/rank/spatiotemporal template:
+
+```tsv
+sample_id	marker	domain	rank	taxon	taxon_marker_reads	clean_reads_total	marker_rpm
+S1	16S	Bacteria	genus	Vibrio	20	1000000	20
+```
+
+### Template Groups
+
+| Category | RStudio template | Main outputs | Default statistical approach |
+| --- | --- | --- | --- |
+| Diversity | `scripts/diversity_alpha_beta.R` | alpha diversity, PCoA, PERMANOVA, beta dispersion | Bray-Curtis on relative abundance, 9999 permutations |
+| Differential abundance | `scripts/differential_abundance_compositional.R` | overall tests, group contrasts, volcano plot, top feature bars | CLR transform, linear model with optional covariates, BH-FDR |
+| Biomarkers | `scripts/biomarker_discovery_nonparametric.R` | biomarker candidates, pairwise Wilcoxon tests, effect-size plot, CLR heatmap | Kruskal-Wallis, BH-FDR, minimum log2 fold-change |
+| Correlation and network | `scripts/network_association_analysis.R` | all correlations, filtered edge table, node metrics, heatmap, optional network plot | Spearman correlation on CLR abundance, global BH-FDR |
+| Functional prediction | `scripts/functional_profile_analysis.R` | top predicted functions, PCoA, PERMANOVA, CLR differential tests | Bray-Curtis PERMANOVA and CLR linear models |
+| Other analyses | `scripts/taxa_time_rank_spacetime.R` | target taxa dynamics, rank diversity, time/space composition | long-table summaries, Shannon/Simpson by rank |
+| Other analyses | `scripts/disturbance_event_response.R` | event PERMANOVA, environment response tests, focal-taxon models, lagged microbe screens | longitudinal event screening with site/time adjustment |
+
+### Diversity Template
+
+Open `scripts/diversity_alpha_beta.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  table = "marker_count_out/04_abundance/marker_rpm.genus.matrix.tsv",
+  metadata = "",
+  `table-format` = "sample_rows",
+  `metadata-cols` = "year,month,depth,site_type",
+  group = "site_type",
+  covariates = "year,month",
+  strata = "",
+  outdir = "analysis_out/diversity_genus"
+)
+```
+
+### Differential Abundance Template
+
+Open `scripts/differential_abundance_compositional.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  table = "marker_count_out/04_abundance/marker_rpm.genus.matrix.tsv",
+  metadata = "",
+  `table-format` = "sample_rows",
+  `metadata-cols` = "year,month,depth,site_type",
+  group = "site_type",
+  reference = "",
+  covariates = "year,month",
+  outdir = "analysis_out/differential_genus"
+)
+```
+
+### Biomarker Template
+
+Open `scripts/biomarker_discovery_nonparametric.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  table = "marker_count_out/04_abundance/marker_rpm.genus.matrix.tsv",
+  metadata = "",
+  `table-format` = "sample_rows",
+  `metadata-cols` = "year,month,depth,site_type",
+  group = "site_type",
+  outdir = "analysis_out/biomarkers_genus"
+)
+```
+
+### Correlation And Network Template
+
+Open `scripts/network_association_analysis.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  table = "marker_count_out/04_abundance/marker_rpm.genus.matrix.tsv",
+  metadata = "",
+  `table-format` = "sample_rows",
+  `metadata-cols` = "year,month,depth",
+  outdir = "analysis_out/network_genus",
+  transform = "clr",
+  `cor-method` = "spearman"
+)
+```
+
+### Functional Prediction Template
+
+Use this after external tools such as PICRUSt2, Tax4Fun, or FUNGuild produce a function abundance table. Open `scripts/functional_profile_analysis.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  table = "picrust2_pathways.tsv",
+  metadata = "metadata.tsv",
+  `table-format` = "feature_rows",
+  `feature-col` = "function_id",
+  group = "site_type",
+  covariates = "year,month",
+  outdir = "analysis_out/functions_pathways"
+)
+```
+
+### Target Taxa, Rank Diversity, And Spatiotemporal Template
+
+Open `scripts/taxa_time_rank_spacetime.R` and edit:
+
+```r
+MC_CONFIG <- list(
+  `long-table` = "marker_count_out/04_abundance/marker_rpm.genus.long.tsv",
+  metadata = "metadata.tsv",
+  taxa = "Vibrio,Fusarium",
+  `time-col` = "month",
+  `space-col` = "site",
+  `group-col` = "site_type",
+  `target-rank` = "genus",
+  outdir = "analysis_out/taxa_time_space"
+)
+```
+
+### Disturbance Or Restoration Event Response Template
+
+Use `scripts/disturbance_event_response.R` for repeated sampling at one or more sites where a disturbance, restoration activity, or management action occurs at known time points. The template screens evidence in a defensible order:
+
+1. Did the event change community composition?
+2. Which environmental variables changed after the event?
+3. Do those environmental variables explain the focal microbial response?
+4. After accounting for time/site/event, do focal microbes show lagged associations with other microbial groups?
+
+This is an evidence-screening workflow, not proof of causality. Strong causal claims still require experimental design, replication, and domain justification.
+
+Metadata example:
+
+```tsv
+sample_id	site	year	event	pH	moisture	organic_matter
+S1	A	2019	pre	6.1	20.1	3.4
+S2	A	2020	pre	6.2	19.7	3.3
+S3	A	2021	post	6.8	24.3	4.1
+S4	A	2022	post	6.9	25.0	4.5
+```
+
+RStudio configuration:
+
+```r
+MC_CONFIG <- list(
+  table = "marker_count_out/04_abundance/marker_rpm.genus.matrix.tsv",
+  metadata = "metadata.tsv",
+  `table-format` = "sample_rows",
+  `metadata-cols` = "year,site,event,pH,moisture,organic_matter",
+  `site-col` = "site",
+  `time-col` = "year",
+  `event-col` = "event",
+  `env-cols` = "pH,moisture,organic_matter",
+  `focal-taxa` = "Fusarium,Ascomycota",
+  outdir = "analysis_out/disturbance_event"
+)
+```
+
+Core output tables:
+
+- `community_event_permanova.tsv`: community-level event/time/environment effects.
+- `environment_event_tests.tsv`: environmental variables that changed after the event.
+- `focal_taxa_models.tsv`: event and environment terms explaining focal taxa.
+- `community_axis_driver_screen.tsv`: event, environment, and focal taxa associations with main community gradients.
+- `microbe_lag_response_screen.tsv`: lagged focal-microbe associations with other microbial responders.
+
 ## Checks
 
 Run syntax checks:

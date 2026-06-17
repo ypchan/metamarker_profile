@@ -12,6 +12,7 @@ __pycache__/
 
 # Pipeline outputs
 marker_count_out/
+analysis_out/
 
 # Large downloaded/generated references
 ref/

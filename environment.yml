@@ -11,6 +11,10 @@ dependencies:
   - gawk
   - grep
   - gzip
+  - r-base
+  - r-ggplot2
+  - r-igraph
+  - r-vegan
   - sed
   - seqkit
   - bbmap

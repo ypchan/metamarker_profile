@@ -14,3 +14,4 @@ uninstall:
 check:
 	bash -n meta_marker_count.sh
 	python3 -m py_compile scripts/build_ref_files.py
+	Rscript -e 'files <- list.files("scripts", pattern="[.]R$$", full.names=TRUE); invisible(lapply(files, parse))'
