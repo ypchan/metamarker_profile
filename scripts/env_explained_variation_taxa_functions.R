@@ -379,7 +379,7 @@ if (file.exists(function_file)) {
     mutate(
       sample_id = as.character(sample_id),
       domain = as.character(domain),
-      function = as.character(function),
+      `function` = as.character(`function`),
       abundance = as.numeric(abundance)
     ) %>%
     filter(
@@ -391,8 +391,8 @@ if (file.exists(function_file)) {
       sample_id,
       domain,
       feature_type = "Function",
-      feature_id = function,
-      feature_label = function,
+      feature_id = `function`,
+      feature_label = `function`,
       abundance
     )
 } else {

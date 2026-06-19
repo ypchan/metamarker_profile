@@ -53,13 +53,29 @@ from rich_argparse import RichHelpFormatter
 
 PROGRAM = "build_ref_files.py"
 MISSING = "Unclassified"
+SOFTWARE_DIR = Path(__file__).resolve().parents[1]
 
-DEFAULT_REF_DIR = Path(
-    os.environ.get(
-        "META_MARKER_COUNT_REF_DIR",
-        Path.home() / ".local" / "share" / "meta_marker_count" / "ref",
+
+def default_ref_dir() -> Path:
+    env_ref = os.environ.get("META_MARKER_COUNT_REF_DIR")
+    if env_ref:
+        return Path(env_ref)
+
+    config_path = Path(
+        os.environ.get("META_MARKER_COUNT_REF_CONFIG", SOFTWARE_DIR / ".meta_marker_count_ref_dir")
     )
-)
+    if config_path.is_file():
+        for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            path = Path(line)
+            return path if path.is_absolute() else SOFTWARE_DIR / path
+
+    return SOFTWARE_DIR / "refs"
+
+
+DEFAULT_REF_DIR = default_ref_dir()
 
 TAX_HEADER = [
     "ref_id",

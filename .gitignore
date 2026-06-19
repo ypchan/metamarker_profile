@@ -9,6 +9,7 @@ __pycache__/
 # Local environments
 .venv/
 .env
+.meta_marker_count_ref_dir
 
 # Pipeline outputs
 marker_count_out/
@@ -16,6 +17,7 @@ analysis_out/
 
 # Large downloaded/generated references
 ref/
+refs/
 *.mmi
 *.fasta
 *.fa

@@ -1,7 +1,44 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+resolve_script_dir() {
+    local source="${BASH_SOURCE[0]}" dir
+    while [[ -L "${source}" ]]; do
+        dir="$(cd -P "$(dirname "${source}")" >/dev/null 2>&1 && pwd)"
+        source="$(readlink "${source}")"
+        [[ "${source}" == /* ]] || source="${dir}/${source}"
+    done
+    cd -P "$(dirname "${source}")" >/dev/null 2>&1 && pwd
+}
+
+read_default_ref_dir() {
+    local software_dir="$1" config_file line
+    if [[ -n "${META_MARKER_COUNT_REF_DIR:-}" ]]; then
+        printf '%s\n' "${META_MARKER_COUNT_REF_DIR}"
+        return 0
+    fi
+
+    config_file="${META_MARKER_COUNT_REF_CONFIG:-${software_dir}/.meta_marker_count_ref_dir}"
+    if [[ -s "${config_file}" ]]; then
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -n "${line}" ]] || continue
+            if [[ "${line}" == /* ]]; then
+                printf '%s\n' "${line}"
+            else
+                printf '%s/%s\n' "${software_dir}" "${line}"
+            fi
+            return 0
+        done < "${config_file}"
+    fi
+
+    printf '%s/refs\n' "${software_dir}"
+}
+
 PROGRAM="$(basename "$0")"
+SOFTWARE_DIR="$(resolve_script_dir)"
 
 # ==============================================================================
 # Defaults
@@ -20,7 +57,7 @@ OUTDIR="marker_count_out"
 STEPS="all"
 MARKERS="16S,ITS"
 
-DEFAULT_REF_DIR="${META_MARKER_COUNT_REF_DIR:-${HOME:-.}/.local/share/meta_marker_count/ref}"
+DEFAULT_REF_DIR="$(read_default_ref_dir "${SOFTWARE_DIR}")"
 REF_DIR="${DEFAULT_REF_DIR}"
 SILVA_REF_PREFIX="SILVA_138.2_SSURef_NR99_tax_silva"
 UNITE_REF_PREFIX="UNITE_public_19.02.2025"
@@ -36,7 +73,16 @@ TAXONOMY=""
 RANK="genus"
 JOBS=4
 THREADS_PER_SAMPLE=4
-SEQKIT_THREADS=1
+SEQKIT_THREADS="auto"
+SEQKIT_MAX_THREADS=4
+BBDUK_THREADS="auto"
+BBDUK_MAX_THREADS=12
+MINIMAP2_THREADS="auto"
+MINIMAP2_MAX_THREADS=12
+TOTAL_THREAD_BUDGET=0
+READS_COUNT_JOBS=0
+EXTRACT_JOBS=0
+ALIGN_JOBS=0
 BBMAP_MEM="64G"
 
 # BBDuk candidate-read extraction defaults.
@@ -76,11 +122,18 @@ RESUME=1
 CLEAN_TMP=0
 DRY_RUN=0
 CHECK_DEPS_ONLY=0
+KEEP_TASK_LOGS=0
+PROGRESS_INTERVAL=5
 
 # Runtime paths; initialized in init_paths().
 MANIFEST=""
+RUN_DIR=""
 LOG_DIR=""
+TASK_LOG_DIR=""
+COMMAND_DIR=""
+FAILED_LOG_DIR=""
 STATUS_DIR=""
+TMP_DIR=""
 CLEAN_DIR=""
 CLEAN_OUT=""
 CLEAN_TMP_DIR=""
@@ -127,26 +180,123 @@ _log_plain() {
 }
 
 log() {
+    [[ "$#" -gt 0 && -n "${1:-}" ]] || return 0
     printf '%b[%s] [%bINFO%b] %s%b\n' "${DIM}" "$(ts)" "${GREEN}" "${RESET}${DIM}" "$*" "${RESET}" >&2
     _log_plain INFO "$*"
 }
 
 log_step() {
+    [[ "$#" -gt 0 && -n "${1:-}" ]] || return 0
     printf '%b[%s] [%bSTEP%b] %s%b\n' "${DIM}" "$(ts)" "${CYAN}" "${RESET}${DIM}" "$*" "${RESET}" >&2
     _log_plain STEP "$*"
 }
 
 log_warn() {
+    [[ "$#" -gt 0 && -n "${1:-}" ]] || return 0
     printf '%b[%s] [%bWARN%b] %s%b\n' "${DIM}" "$(ts)" "${YELLOW}" "${RESET}${DIM}" "$*" "${RESET}" >&2
     _log_plain WARN "$*"
 }
 
 log_error() {
+    [[ "$#" -gt 0 && -n "${1:-}" ]] || return 0
     printf '%b[%s] [%bERROR%b] %s%b\n' "${DIM}" "$(ts)" "${RED}" "${RESET}${DIM}" "$*" "${RESET}" >&2
     _log_plain ERROR "$*"
 }
 
 die() { log_error "$*"; exit 1; }
+
+record_command() {
+    local stage="$1" sample_id="$2" file arg
+    shift 2
+    [[ -n "${COMMAND_DIR:-}" && "$#" -gt 0 ]] || return 0
+    file="${COMMAND_DIR}/${stage}/${sample_id}.commands.sh"
+    mkdir -p "$(dirname "${file}")"
+    {
+        printf '# [%s] stage=%s sample_id=%q\n' "$(ts)" "${stage}" "${sample_id}"
+        printf 'cd %q\n' "${PWD}"
+        printf '%q' "$1"
+        shift
+        for arg in "$@"; do
+            printf ' %q' "${arg}"
+        done
+        printf '\n\n'
+    } >> "${file}"
+}
+
+# ==============================================================================
+# Progress display
+# ==============================================================================
+format_duration() {
+    local sec="${1:-0}"
+    local h=$((sec / 3600))
+    local m=$(((sec % 3600) / 60))
+    local s=$((sec % 60))
+    if [[ "${h}" -gt 0 ]]; then
+        printf '%dh%02dm%02ds' "${h}" "${m}" "${s}"
+    elif [[ "${m}" -gt 0 ]]; then
+        printf '%dm%02ds' "${m}" "${s}"
+    else
+        printf '%ds' "${s}"
+    fi
+}
+
+count_done_files() {
+    local dir="$1" pattern="$2"
+    find "${dir}" -maxdepth 1 -type f -name "${pattern}" 2>/dev/null | wc -l | tr -d ' '
+}
+
+progress_bar() {
+    local done="$1" total="$2" width="${3:-24}"
+    local filled=0 empty=0
+    if [[ "${total}" -gt 0 ]]; then
+        filled=$((done * width / total))
+    fi
+    [[ "${filled}" -gt "${width}" ]] && filled="${width}"
+    empty=$((width - filled))
+    printf '%*s' "${filled}" '' | tr ' ' '='
+    printf '%*s' "${empty}" '' | tr ' ' '-'
+}
+
+progress_watch() {
+    local label="$1" total="$2" done_dir="$3" pattern="$4" pid="$5"
+    local start now elapsed done pct bar status
+    start=$(date +%s)
+
+    while kill -0 "${pid}" 2>/dev/null; do
+        done=$(count_done_files "${done_dir}" "${pattern}")
+        [[ "${done}" -gt "${total}" ]] && done="${total}"
+        now=$(date +%s)
+        elapsed=$((now - start))
+        pct=0
+        [[ "${total}" -gt 0 ]] && pct=$((done * 100 / total))
+        bar=$(progress_bar "${done}" "${total}" 24)
+        printf '\r%b[%s] [%bRUN%b] %-12s [%s] %3d%%  %s/%s  elapsed=%s%b' \
+            "${DIM}" "$(ts)" "${BLUE}" "${RESET}${DIM}" "${label}" "${bar}" "${pct}" "${done}" "${total}" "$(format_duration "${elapsed}")" "${RESET}" >&2
+        sleep "${PROGRESS_INTERVAL}"
+    done
+
+    wait "${pid}"
+    status=$?
+    done=$(count_done_files "${done_dir}" "${pattern}")
+    [[ "${done}" -gt "${total}" ]] && done="${total}"
+    now=$(date +%s)
+    elapsed=$((now - start))
+    pct=0
+    [[ "${total}" -gt 0 ]] && pct=$((done * 100 / total))
+    bar=$(progress_bar "${done}" "${total}" 24)
+    if [[ "${status}" -eq 0 ]]; then
+        printf '\r%b[%s] [%bDONE%b] %-12s [%s] %3d%%  %s/%s  elapsed=%s%b\n' \
+            "${DIM}" "$(ts)" "${GREEN}" "${RESET}${DIM}" "${label}" "${bar}" "${pct}" "${done}" "${total}" "$(format_duration "${elapsed}")" "${RESET}" >&2
+    else
+        printf '\r%b[%s] [%bFAIL%b] %-12s [%s] %3d%%  %s/%s  elapsed=%s%b\n' \
+            "${DIM}" "$(ts)" "${RED}" "${RESET}${DIM}" "${label}" "${bar}" "${pct}" "${done}" "${total}" "$(format_duration "${elapsed}")" "${RESET}" >&2
+    fi
+    return "${status}"
+}
+
+marker_count_n() {
+    awk -v s="${MARKERS}" 'BEGIN{n=split(s,a,","); print n+0}'
+}
 
 # ==============================================================================
 # Help
@@ -232,6 +382,11 @@ ITS FASTA : ${REF_DIR}/${UNITE_REF_PREFIX}.shortid.fasta
 ITS index : ${REF_DIR}/${UNITE_REF_PREFIX}.shortid.fasta.mmi
 taxonomy  : ${REF_DIR}/ref_taxonomy.tsv
 
+Resolution order:
+  1. META_MARKER_COUNT_REF_DIR environment variable.
+  2. ${SOFTWARE_DIR}/.meta_marker_count_ref_dir when present.
+  3. ${SOFTWARE_DIR}/refs.
+
 BBDuk candidate-read extraction
 -------------------------------
 16S: k=${K_16S}, hdist=${HDIST_16S}, mkh=${MKH_16S}, mink=${MINK_16S}
@@ -251,7 +406,7 @@ minimap2 alignment
 
 Reasoning:
   -x sr is appropriate for PE short reads.
-  -N 10 preserves multiple good hits, allowing the abundance step to mark ambiguous reads.
+  -N 10 preserves multiple good hits, allowing the abundance step to choose the best hit by PAF metrics.
 
 Abundance filters
 -----------------
@@ -259,26 +414,28 @@ Abundance filters
 18S: identity>=${MIN_IDENTITY_18S}, aln_len>=${MIN_ALN_LEN_18S}, qcov>=${MIN_QCOV_18S}
 ITS: identity>=${MIN_IDENTITY_ITS}, aln_len>=${MIN_ALN_LEN_ITS}, qcov>=${MIN_QCOV_ITS}
 mapq>=${MIN_MAPQ}
-near-top identity difference <= ${TOP_IDENTITY_DIFF}
-near-top alignment-length difference <= ${TOP_ALN_LEN_DIFF}
+legacy near-top identity window = ${TOP_IDENTITY_DIFF}
+legacy near-top alignment-length window = ${TOP_ALN_LEN_DIFF}
 
 Reasoning:
   Genus is the default rank because it is more stable than species for PE marker reads.
   16S/18S use 0.97 identity for conservative genus-level ecological comparison.
   ITS uses 0.95 because fungal ITS is more variable and database coverage is uneven.
-  Near-top hits are compared before assignment; reads with conflicting near-best taxa are marked ambiguous.
+  Paired reads are counted at read level but arbitrated at pair level. If R1/R2 disagree, both mates are assigned to the better mate classification, selected by identity, alignment length, matches, MAPQ, query coverage, target length, mate, then target ID.
+  The near-top options are kept for command-line compatibility; best-hit assignment no longer discards conflicting near-top reads.
 
 Reads-count normalization
 -------------------------
-marker_rpm = taxon_marker_reads / clean_reads_total * 1,000,000
+marker_rpm  = taxon_marker_reads / clean_reads_total * 1,000,000
+marker_rpkm = taxon_marker_reads / (clean_reads_total / 1,000,000) / (mean_target_length_bp / 1,000)
 clean_reads_total = R1 read count * 2
+mean_target_length_bp is estimated from the best assigned reference hit length for each assigned read.
 
 EOF_DEFAULTS
 }
 
 show_help() {
     cat <<EOF_HELP
-${BOLD}${PROGRAM}${RESET}
 
 Integrated marker-read counting pipeline for paired-end clean reads.
 
@@ -288,25 +445,20 @@ Workflow:
   3. Align marker reads with minimap2 and write PAF.
   4. Parse PAF with shell/awk and calculate marker RPM.
 
-${BOLD}Input TSV columns:${RESET}
+${BOLD}Input:${RESET}
   Multi-sample TSV must have a header. Columns are matched by name, not by position.
   Required column names: sample_id, r1_path, r2_path
   Optional metadata columns: year, month, depth, and any other sample metadata columns.
   Missing year/month/depth are filled with NA. Extra metadata columns are retained and carried into abundance outputs.
 
-${BOLD}Required arguments - sample input:${RESET}
+${BOLD}Required arguments:${RESET}
   ${CYAN}-i, --input${RESET} FILE                Multi-sample TSV input.
   ${DIM}or single-sample mode:${RESET}
   ${CYAN}--sample-id${RESET} ID                  Single-sample ID.
   ${CYAN}--r1${RESET} FILE                       Single-sample R1 FASTQ(.gz).
   ${CYAN}--r2${RESET} FILE                       Single-sample R2 FASTQ(.gz).
 
-${BOLD}Reference data defaults and overrides:${RESET}
-  Default reference directory:
-    ${REF_DIR}
-  Override directory with ${CYAN}--ref-dir${RESET} DIR or META_MARKER_COUNT_REF_DIR.
-
-  Default files:
+${BOLD}Reference data:${RESET}
     16S FASTA : ${REF_DIR}/${SILVA_REF_PREFIX}.dna.arc_bac.shortid.fasta
     16S index : ${REF_DIR}/${SILVA_REF_PREFIX}.dna.arc_bac.shortid.fasta.mmi
     18S FASTA : ${REF_DIR}/${SILVA_REF_PREFIX}.dna.euk.shortid.fasta
@@ -332,8 +484,13 @@ ${BOLD}Optional arguments - workflow control:${RESET}
   ${CYAN}--rank${RESET} RANK                     domain,phylum,class,order,family,genus,species,all. default: ${RANK}
 ${BOLD}Optional arguments - parallelism and resources:${RESET}
   ${CYAN}-j, --jobs${RESET} INT                  Number of samples processed in parallel. default: ${JOBS}
-  ${CYAN}-p, --threads-per-sample${RESET} INT    Threads used by BBDuk/minimap2 per sample. default: ${THREADS_PER_SAMPLE}
-  ${CYAN}--seqkit-threads${RESET} INT            Threads used by seqkit per sample. default: ${SEQKIT_THREADS}
+  ${CYAN}-p, --threads-per-sample${RESET} INT    Per-sample CPU budget before tool caps. default: ${THREADS_PER_SAMPLE}
+  ${CYAN}--seqkit-threads${RESET} INT|auto       Threads used by seqkit per sample. default: ${SEQKIT_THREADS}
+  ${CYAN}--seqkit-max-threads${RESET} INT        Cap for seqkit threads. default: ${SEQKIT_MAX_THREADS}
+  ${CYAN}--bbduk-threads${RESET} INT|auto        Threads used by BBDuk per sample. default: ${BBDUK_THREADS}
+  ${CYAN}--bbduk-max-threads${RESET} INT         Cap for BBDuk threads. default: ${BBDUK_MAX_THREADS}
+  ${CYAN}--minimap2-threads${RESET} INT|auto     Threads used by minimap2 per sample. default: ${MINIMAP2_THREADS}
+  ${CYAN}--minimap2-max-threads${RESET} INT      Cap for minimap2 threads. default: ${MINIMAP2_MAX_THREADS}
   ${CYAN}--bbmap-mem${RESET} STR                 BBDuk Java heap, e.g. 50G, 250G. default: ${BBMAP_MEM}
 
 ${BOLD}Optional arguments - BBDuk extraction parameters:${RESET}
@@ -365,8 +522,8 @@ ${BOLD}Optional arguments - abundance filters:${RESET}
   ${CYAN}--min-qcov-18s${RESET} FLOAT            default: ${MIN_QCOV_18S}
   ${CYAN}--min-qcov-its${RESET} FLOAT            default: ${MIN_QCOV_ITS}
   ${CYAN}--min-mapq${RESET} INT                  default: ${MIN_MAPQ}
-  ${CYAN}--top-identity-diff${RESET} FLOAT       default: ${TOP_IDENTITY_DIFF}
-  ${CYAN}--top-aln-len-diff${RESET} INT          default: ${TOP_ALN_LEN_DIFF}
+  ${CYAN}--top-identity-diff${RESET} FLOAT       Legacy compatibility option. default: ${TOP_IDENTITY_DIFF}
+  ${CYAN}--top-aln-len-diff${RESET} INT          Legacy compatibility option. default: ${TOP_ALN_LEN_DIFF}
 
 ${BOLD}Optional arguments - resume, overwrite and logging:${RESET}
   ${CYAN}--force${RESET}                         Re-run and overwrite outputs.
@@ -374,6 +531,8 @@ ${BOLD}Optional arguments - resume, overwrite and logging:${RESET}
   ${CYAN}--clean-tmp${RESET}                     Remove temporary files after successful run.
   ${CYAN}--dry-run${RESET}                       Check inputs and print run plan only.
   ${CYAN}--check-deps${RESET}                    Check required external tools and exit.
+  ${CYAN}--keep-task-logs${RESET}                 Keep per-sample tool logs even when tasks succeed.
+  ${CYAN}--progress-interval${RESET} INT          Seconds between progress refreshes. default: ${PROGRESS_INTERVAL}
   ${CYAN}--print-format${RESET}                  Print input format examples and exit.
   ${CYAN}--print-defaults${RESET}                Explain default parameters and exit.
   ${CYAN}-h, --help${RESET}                      Show this help.
@@ -386,18 +545,23 @@ ${BOLD}Example:${RESET}
     --jobs 8 \\
     --threads-per-sample 4
 
-${BOLD}Structured outputs:${RESET}
-  OUTDIR/00_manifest/samples.tsv
-  OUTDIR/00_logs/marker_count.YYYYmmdd_HHMMSS.log
-  OUTDIR/01_reads_count/clean_reads.tsv
-  OUTDIR/02_marker_reads/{16S,18S,ITS,stats,logs,tmp}/
-  OUTDIR/03_align/{16S,18S,ITS,logs,tmp}/
-  OUTDIR/04_abundance/marker_rpm.<rank>.long.tsv
-  OUTDIR/04_abundance/marker_rpm.<rank>.matrix.tsv
-  OUTDIR/04_abundance/marker_rpm.<rank>.domain_total.tsv
-  OUTDIR/04_abundance/marker_rpm.<rank>.assignment_stats.tsv
-  OUTDIR/99_checkpoints/{reads_count,extract,align,abundance}/
+${BOLD}Output:${RESET}
+  OUTDIR/sample_manifest.tsv
+  OUTDIR/run_config.tsv
+  OUTDIR/commands/{reads_count,extract,align,abundance}/
+  OUTDIR/meta_marker_count.YYYYmmdd_HHMMSS.log
+  OUTDIR/reads_stat.tsv
+  OUTDIR/all.marker_rpm.<rank>.long.tsv
+  OUTDIR/all.marker_rpm.<rank>.assignment_stats.tsv
+  OUTDIR/02_marker_reads/{16S,18S,ITS,stats,tmp}/
+  OUTDIR/03_align/{16S,18S,ITS,tmp}/
+  OUTDIR/.checkpoints/{reads_count,extract,align,abundance}/
     Internal checkpoint files for --resume. These are not result tables.
+
+  Re-runnable per-stage command lines are written under OUTDIR/commands.
+  Per-sample tool logs are written under OUTDIR/.tmp/task_logs while running.
+  Successful task logs are removed by default; failed logs are kept.
+  Use --keep-task-logs to keep all per-sample logs for debugging.
 
 EOF_HELP
 }
@@ -409,6 +573,37 @@ require_value() {
 
 is_positive_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 is_nonnegative_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+min_int() {
+    if [[ "$1" -lt "$2" ]]; then
+        echo "$1"
+    else
+        echo "$2"
+    fi
+}
+
+resolve_tool_threads() {
+    local label="$1" requested="$2" cap="$3" resolved
+    is_positive_int "${cap}" || die "${label} max threads must be a positive integer: ${cap}"
+    if [[ "${requested}" == "auto" || "${requested}" == "0" ]]; then
+        requested="${THREADS_PER_SAMPLE}"
+    else
+        is_positive_int "${requested}" || die "${label} threads must be a positive integer, 0, or auto: ${requested}"
+    fi
+    resolved="$(min_int "${requested}" "${cap}")"
+    if [[ "${requested}" -gt "${cap}" ]]; then
+        log_warn "${label} threads capped at ${cap}; requested ${requested}. Raise the max-thread option only after benchmarking."
+    fi
+    echo "${resolved}"
+}
+
+calc_step_jobs() {
+    local sample_count="$1" tool_threads="$2" jobs
+    jobs=$(( TOTAL_THREAD_BUDGET / tool_threads ))
+    [[ "${jobs}" -lt 1 ]] && jobs=1
+    [[ "${jobs}" -gt "${sample_count}" ]] && jobs="${sample_count}"
+    echo "${jobs}"
+}
 
 normalize_marker_token() {
     echo "$1" | tr '[:lower:]' '[:upper:]'
@@ -533,6 +728,12 @@ parse_args() {
             --threads-per-sample=*) THREADS_PER_SAMPLE="${1#*=}"; shift ;;
             --seqkit-threads) require_value "$1" "${2:-}"; SEQKIT_THREADS="$2"; shift 2 ;;
             --seqkit-threads=*) SEQKIT_THREADS="${1#*=}"; shift ;;
+            --seqkit-max-threads) require_value "$1" "${2:-}"; SEQKIT_MAX_THREADS="$2"; shift 2 ;;
+            --seqkit-max-threads=*) SEQKIT_MAX_THREADS="${1#*=}"; shift ;;
+            --bbduk-threads) require_value "$1" "${2:-}"; BBDUK_THREADS="$2"; shift 2 ;;
+            --bbduk-threads=*) BBDUK_THREADS="${1#*=}"; shift ;;
+            --bbduk-max-threads) require_value "$1" "${2:-}"; BBDUK_MAX_THREADS="$2"; shift 2 ;;
+            --bbduk-max-threads=*) BBDUK_MAX_THREADS="${1#*=}"; shift ;;
             --bbmap-mem) require_value "$1" "${2:-}"; BBMAP_MEM="$2"; shift 2 ;;
             --bbmap-mem=*) BBMAP_MEM="${1#*=}"; shift ;;
 
@@ -563,6 +764,10 @@ parse_args() {
 
             --minimap2-preset) require_value "$1" "${2:-}"; MINIMAP2_PRESET="$2"; shift 2 ;;
             --minimap2-preset=*) MINIMAP2_PRESET="${1#*=}"; shift ;;
+            --minimap2-threads) require_value "$1" "${2:-}"; MINIMAP2_THREADS="$2"; shift 2 ;;
+            --minimap2-threads=*) MINIMAP2_THREADS="${1#*=}"; shift ;;
+            --minimap2-max-threads) require_value "$1" "${2:-}"; MINIMAP2_MAX_THREADS="$2"; shift 2 ;;
+            --minimap2-max-threads=*) MINIMAP2_MAX_THREADS="${1#*=}"; shift ;;
             --minimap2-N) require_value "$1" "${2:-}"; MINIMAP2_N="$2"; shift 2 ;;
             --minimap2-N=*) MINIMAP2_N="${1#*=}"; shift ;;
 
@@ -598,6 +803,9 @@ parse_args() {
             --clean-tmp) CLEAN_TMP=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             --check-deps) CHECK_DEPS_ONLY=1; shift ;;
+            --keep-task-logs) KEEP_TASK_LOGS=1; shift ;;
+            --progress-interval) require_value "$1" "${2:-}"; PROGRESS_INTERVAL="$2"; shift 2 ;;
+            --progress-interval=*) PROGRESS_INTERVAL="${1#*=}"; shift ;;
             --print-format) show_input_format; exit 0 ;;
             --print-defaults) show_defaults; exit 0 ;;
             -h|--help) show_help; exit 0 ;;
@@ -654,25 +862,33 @@ check_dependencies() {
 # Validation and initialization
 # ==============================================================================
 init_paths() {
-    MANIFEST="${OUTDIR}/00_manifest/samples.tsv"
-    LOG_DIR="${OUTDIR}/00_logs"
-    STATUS_DIR="${OUTDIR}/99_checkpoints"
-    CLEAN_DIR="${OUTDIR}/01_reads_count"
-    CLEAN_OUT="${CLEAN_DIR}/clean_reads.tsv"
-    CLEAN_TMP_DIR="${CLEAN_DIR}/tmp_counts"
+    # Flat result layout: small human-facing files live directly in OUTDIR.
+    # Only large/intermediate files and hidden runtime state are placed in directories.
+    RUN_DIR="${OUTDIR}"
+    MANIFEST="${OUTDIR}/sample_manifest.tsv"
+    LOG_DIR="${OUTDIR}"
+    TASK_LOG_DIR="${OUTDIR}/.tmp/task_logs"
+    COMMAND_DIR="${OUTDIR}/commands"
+    FAILED_LOG_DIR="${OUTDIR}/.tmp/failed_logs"
+    STATUS_DIR="${OUTDIR}/.checkpoints"
+    TMP_DIR="${OUTDIR}/.tmp"
+    CLEAN_DIR="${OUTDIR}"
+    CLEAN_OUT="${OUTDIR}/reads_stat.tsv"
+    CLEAN_TMP_DIR="${TMP_DIR}/01_reads_count"
     MARKER_DIR="${OUTDIR}/02_marker_reads"
     ALIGN_DIR="${OUTDIR}/03_align"
-    ABUND_DIR="${OUTDIR}/04_abundance"
-    SCRIPT_DIR="${OUTDIR}/00_scripts"
+    ABUND_DIR="${OUTDIR}"
+    SCRIPT_DIR="${TMP_DIR}/scripts"
 
     mkdir -p \
-        "${OUTDIR}" "${LOG_DIR}" "${STATUS_DIR}" "${CLEAN_DIR}" "${CLEAN_TMP_DIR}" \
-        "${MARKER_DIR}/16S" "${MARKER_DIR}/18S" "${MARKER_DIR}/ITS" "${MARKER_DIR}/stats" "${MARKER_DIR}/logs" "${MARKER_DIR}/tmp" \
-        "${ALIGN_DIR}/16S" "${ALIGN_DIR}/18S" "${ALIGN_DIR}/ITS" "${ALIGN_DIR}/logs" "${ALIGN_DIR}/tmp" \
-        "${ABUND_DIR}" "${SCRIPT_DIR}" \
-        "${STATUS_DIR}/reads_count" "${STATUS_DIR}/extract" "${STATUS_DIR}/align" "${STATUS_DIR}/abundance"
+        "${OUTDIR}" "${TASK_LOG_DIR}" "${FAILED_LOG_DIR}" \
+        "${COMMAND_DIR}/reads_count" "${COMMAND_DIR}/extract" "${COMMAND_DIR}/align" "${COMMAND_DIR}/abundance" \
+        "${STATUS_DIR}/reads_count" "${STATUS_DIR}/extract" "${STATUS_DIR}/align" "${STATUS_DIR}/abundance" \
+        "${TMP_DIR}" "${CLEAN_TMP_DIR}" "${SCRIPT_DIR}" \
+        "${MARKER_DIR}/16S" "${MARKER_DIR}/18S" "${MARKER_DIR}/ITS" "${MARKER_DIR}/stats" "${MARKER_DIR}/tmp" \
+        "${ALIGN_DIR}/16S" "${ALIGN_DIR}/18S" "${ALIGN_DIR}/ITS" "${ALIGN_DIR}/tmp"
 
-    MAIN_LOG="${LOG_DIR}/marker_count.$(date '+%Y%m%d_%H%M%S').log"
+    MAIN_LOG="${OUTDIR}/meta_marker_count.$(date '+%Y%m%d_%H%M%S').log"
     touch "${MAIN_LOG}"
 }
 
@@ -684,8 +900,15 @@ require_reference_file() {
 
 validate_args() {
     is_positive_int "${JOBS}" || die "--jobs must be a positive integer: ${JOBS}"
+    is_positive_int "${PROGRESS_INTERVAL}" || die "--progress-interval must be a positive integer: ${PROGRESS_INTERVAL}"
     is_positive_int "${THREADS_PER_SAMPLE}" || die "--threads-per-sample must be a positive integer: ${THREADS_PER_SAMPLE}"
-    is_positive_int "${SEQKIT_THREADS}" || die "--seqkit-threads must be a positive integer: ${SEQKIT_THREADS}"
+    is_positive_int "${SEQKIT_MAX_THREADS}" || die "--seqkit-max-threads must be a positive integer: ${SEQKIT_MAX_THREADS}"
+    is_positive_int "${BBDUK_MAX_THREADS}" || die "--bbduk-max-threads must be a positive integer: ${BBDUK_MAX_THREADS}"
+    is_positive_int "${MINIMAP2_MAX_THREADS}" || die "--minimap2-max-threads must be a positive integer: ${MINIMAP2_MAX_THREADS}"
+    TOTAL_THREAD_BUDGET=$((JOBS * THREADS_PER_SAMPLE))
+    SEQKIT_THREADS="$(resolve_tool_threads "seqkit" "${SEQKIT_THREADS}" "${SEQKIT_MAX_THREADS}")"
+    BBDUK_THREADS="$(resolve_tool_threads "BBDuk" "${BBDUK_THREADS}" "${BBDUK_MAX_THREADS}")"
+    MINIMAP2_THREADS="$(resolve_tool_threads "minimap2" "${MINIMAP2_THREADS}" "${MINIMAP2_MAX_THREADS}")"
 
     for v in K_16S K_18S K_ITS MKH_16S MKH_18S MKH_ITS MINIMAP2_N MIN_ALN_LEN_16S MIN_ALN_LEN_18S MIN_ALN_LEN_ITS TOP_ALN_LEN_DIFF; do
         is_positive_int "${!v}" || die "--${v,,} must be a positive integer: ${!v}"
@@ -841,18 +1064,34 @@ prepare_manifest() {
     log "Sample count: ${n}"
 }
 
+compute_step_parallelism() {
+    local sample_count
+    sample_count=$(awk -F '\t' 'NR>1 && NF>=6 {n++} END{print n+0}' "${MANIFEST}")
+    READS_COUNT_JOBS="$(calc_step_jobs "${sample_count}" "${SEQKIT_THREADS}")"
+    EXTRACT_JOBS="$(calc_step_jobs "${sample_count}" "${BBDUK_THREADS}")"
+    ALIGN_JOBS="$(calc_step_jobs "${sample_count}" "${MINIMAP2_THREADS}")"
+}
+
 print_run_plan() {
     cat >&2 <<EOF_PLAN
 
 ${BOLD}Run plan${RESET}
   outdir             : ${OUTDIR}
   manifest           : ${MANIFEST}
+  task log dir       : ${TASK_LOG_DIR}
+  command dir        : ${COMMAND_DIR}
   steps              : ${STEPS}
   markers            : ${MARKERS}
   rank               : ${RANK}
   jobs               : ${JOBS}
   threads/sample     : ${THREADS_PER_SAMPLE}
+  cpu budget         : ${TOTAL_THREAD_BUDGET}
   seqkit threads     : ${SEQKIT_THREADS}
+  BBDuk threads      : ${BBDUK_THREADS}
+  minimap2 threads   : ${MINIMAP2_THREADS}
+  reads_count jobs   : ${READS_COUNT_JOBS}
+  extract jobs       : ${EXTRACT_JOBS}
+  align jobs         : ${ALIGN_JOBS}
   resume             : ${RESUME}
   force              : ${FORCE}
   reference dir      : ${REF_DIR}
@@ -863,11 +1102,12 @@ ${BOLD}Run plan${RESET}
   index 18S          : ${INDEX_18S}
   index ITS          : ${INDEX_ITS}
   taxonomy           : ${TAXONOMY}
-  reads count table  : ${CLEAN_OUT}
+  reads stats table : ${CLEAN_OUT}
   marker read dir    : ${MARKER_DIR}
   alignment dir      : ${ALIGN_DIR}
-  abundance dir      : ${ABUND_DIR}
+  abundance prefix   : ${ABUND_DIR}/all.marker_rpm
   main log           : ${MAIN_LOG}
+  keep task logs     : ${KEEP_TASK_LOGS}
 EOF_PLAN
 }
 
@@ -876,28 +1116,66 @@ EOF_PLAN
 # ==============================================================================
 clean_count_one_sample() {
     local row_no="$1" sample_id="$2" year="$3" month="$4" depth="$5" r1_path="$6" r2_path="$7"
-    local out="${CLEAN_TMP_DIR}/${row_no}.${sample_id}.clean_reads.tsv"
+    local out="${CLEAN_TMP_DIR}/${row_no}.${sample_id}.reads_stat.tsv"
     local done="${STATUS_DIR}/reads_count/${sample_id}.done"
-    local log_file="${LOG_DIR}/${sample_id}.reads_count.log"
+    local log_file="${TASK_LOG_DIR}/reads_count.${sample_id}.log"
+    local stats_tmp="${CLEAN_TMP_DIR}/${row_no}.${sample_id}.seqkit.stats.tmp"
 
     if [[ "${FORCE}" -eq 0 && "${RESUME}" -eq 1 && -s "${out}" && -s "${done}" ]]; then
-        echo "[$(ts)] [INFO] reads_count skip: ${sample_id}" >> "${log_file}"
+        echo "[$(ts)] [INFO] counting reads skip: ${sample_id}" >> "${log_file}"
         return 0
     fi
 
-    [[ -s "${r1_path}" ]] || { echo "[$(ts)] [ERROR] Missing R1: ${r1_path}" >> "${log_file}"; return 1; }
-    [[ -s "${r2_path}" ]] || { echo "[$(ts)] [ERROR] Missing R2: ${r2_path}" >> "${log_file}"; return 1; }
+    echo "[$(ts)] [INFO] counting reads start: ${sample_id}" > "${log_file}"
+
+    [[ -s "${r1_path}" ]] || { echo "[$(ts)] [ERROR] Missing R1: ${r1_path}" >> "${log_file}"; printf '[%s] [ERROR] Missing R1 for %s: %s\n' "$(ts)" "${sample_id}" "${r1_path}" >&2; return 1; }
+    [[ -s "${r2_path}" ]] || { echo "[$(ts)] [ERROR] Missing R2: ${r2_path}" >> "${log_file}"; printf '[%s] [ERROR] Missing R2 for %s: %s\n' "$(ts)" "${sample_id}" "${r2_path}" >&2; return 1; }
 
     local read_pairs clean_reads_total
-    read_pairs=$(seqkit stats -j "${SEQKIT_THREADS}" -T "${r1_path}" 2>>"${log_file}" | awk 'NR==2 {gsub(/,/, "", $4); print $4}')
-    [[ "${read_pairs}" =~ ^[0-9]+$ ]] || { echo "[$(ts)] [ERROR] Failed to parse seqkit count for ${r1_path}" >> "${log_file}"; return 1; }
+    record_command reads_count "${sample_id}" seqkit stats -j "${SEQKIT_THREADS}" -T "${r1_path}"
+    { printf '[%s] [CMD]' "$(ts)"; printf ' %q' seqkit stats -j "${SEQKIT_THREADS}" -T "${r1_path}"; printf '\n'; } >> "${log_file}"
+
+    # Do not put seqkit in a pipe here. With `set -euo pipefail`, a seqkit failure
+    # inside command substitution can terminate the child shell before a useful error
+    # message is written, making the parent look like it silently stopped.
+    if ! seqkit stats -j "${SEQKIT_THREADS}" -T "${r1_path}" > "${stats_tmp}" 2>>"${log_file}"; then
+        echo "[$(ts)] [ERROR] seqkit stats failed for ${sample_id}: ${r1_path}" >> "${log_file}"
+        printf '[%s] [ERROR] seqkit stats failed: %s  log=%s\n' "$(ts)" "${sample_id}" "${log_file}" >&2
+        rm -f "${stats_tmp}"
+        return 1
+    fi
+
+    read_pairs=$(awk -F '\t' '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) if ($i == "num_seqs") c = i
+            next
+        }
+        NR == 2 {
+            if (c == "") c = 4
+            gsub(/,/, "", $c)
+            print $c
+            exit
+        }
+    ' "${stats_tmp}")
+
+    if [[ ! "${read_pairs}" =~ ^[0-9]+$ ]]; then
+        echo "[$(ts)] [ERROR] Failed to parse seqkit count for ${r1_path}" >> "${log_file}"
+        echo "[$(ts)] [ERROR] seqkit stats output:" >> "${log_file}"
+        sed 's/^/[SEQKIT] /' "${stats_tmp}" >> "${log_file}" || true
+        printf '[%s] [ERROR] Failed to parse seqkit count: %s  log=%s\n' "$(ts)" "${sample_id}" "${log_file}" >&2
+        rm -f "${stats_tmp}"
+        return 1
+    fi
+    rm -f "${stats_tmp}"
+
     clean_reads_total=$(( read_pairs * 2 ))
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${sample_id}" "${year}" "${month}" "${depth}" "${r1_path}" "${r2_path}" "${read_pairs}" "${clean_reads_total}" > "${out}.tmp"
     mv -f "${out}.tmp" "${out}"
     printf 'sample_id=%s\tread_pairs=%s\tclean_reads_total=%s\n' "${sample_id}" "${read_pairs}" "${clean_reads_total}" > "${done}"
-    echo "[$(ts)] [INFO] reads_count done: ${sample_id} read_pairs=${read_pairs}" >> "${log_file}"
+    echo "[$(ts)] [INFO] counting reads done: ${sample_id} read_pairs=${read_pairs} clean_reads_total=${clean_reads_total}" >> "${log_file}"
+    [[ "${KEEP_TASK_LOGS}" -eq 0 ]] && rm -f "${log_file}"
 }
 
 run_clean_counts() {
@@ -908,32 +1186,48 @@ run_clean_counts() {
         local existing_rows
         existing_rows=$(awk -F '\t' 'NR>1 {n++} END{print n+0}' "${CLEAN_OUT}")
         if [[ "${existing_rows}" -eq "${sample_count}" ]]; then
-            log "Reads-count table exists and row count matches; skipping reads_count step: ${CLEAN_OUT}"
+            log "Reads-stat table exists and row count matches; skipping counting reads: ${CLEAN_OUT}"
             return 0
         fi
     fi
 
-    log_step "Step reads_count: counting reads from clean FASTQ files with seqkit"
-    rm -f "${CLEAN_TMP_DIR}"/*.clean_reads.tsv 2>/dev/null || true
+    log_step "Step 01 counting reads: clean FASTQ read totals with seqkit"
+    if [[ "${FORCE}" -eq 1 || "${RESUME}" -eq 0 ]]; then
+        rm -f "${CLEAN_TMP_DIR}"/*.reads_stat.tsv "${CLEAN_TMP_DIR}"/*.seqkit.stats.tmp "${STATUS_DIR}/reads_count"/*.done 2>/dev/null || true
+    fi
 
-    export CLEAN_TMP_DIR STATUS_DIR LOG_DIR SEQKIT_THREADS FORCE RESUME
-    export -f ts clean_count_one_sample
+    READS_COUNT_JOBS="$(calc_step_jobs "${sample_count}" "${SEQKIT_THREADS}")"
+    log "Step reads_count parallelism: jobs=${READS_COUNT_JOBS}, seqkit_threads=${SEQKIT_THREADS}, cpu_budget=${TOTAL_THREAD_BUDGET}"
 
-    awk -F '\t' 'NR>1 && NF>=6 {
-        row++
-        printf "%s%c%s%c%s%c%s%c%s%c%s%c%s%c", row,0,$1,0,$2,0,$3,0,$4,0,$5,0,$6,0
-    }' "${MANIFEST}" \
-        | xargs -0 -r -P "${JOBS}" -n 7 bash -euo pipefail -c 'clean_count_one_sample "$@"' _
+    export CLEAN_TMP_DIR STATUS_DIR LOG_DIR TASK_LOG_DIR COMMAND_DIR SEQKIT_THREADS FORCE RESUME KEEP_TASK_LOGS
+    export -f ts record_command clean_count_one_sample
+
+    (
+        awk -F '\t' 'NR>1 && NF>=6 {
+            row++
+            printf "%s%c%s%c%s%c%s%c%s%c%s%c%s%c", row,0,$1,0,$2,0,$3,0,$4,0,$5,0,$6,0
+        }' "${MANIFEST}" \
+            | xargs -0 -r -P "${READS_COUNT_JOBS}" -n 7 bash -euo pipefail -c 'clean_count_one_sample "$@"' _
+    ) &
+    local worker_pid=$!
+    if ! progress_watch "counting reads" "${sample_count}" "${STATUS_DIR}/reads_count" "*.done" "${worker_pid}"; then
+        log_error "counting reads failed. Showing the last lines of per-sample logs:"
+        find "${TASK_LOG_DIR}" -maxdepth 1 -type f -name 'reads_count.*.log' -print0 \
+            | xargs -0 -r tail -n 20 >&2 || true
+        die "Step counting reads failed. Failed task logs are in ${TASK_LOG_DIR}"
+    fi
+
+
 
     printf 'sample_id\tyear\tmonth\tdepth\tr1_path\tr2_path\tread_pairs\tclean_reads_total\n' > "${CLEAN_OUT}.tmp"
     local i f
     for i in $(seq 1 "${sample_count}"); do
-        f=$(find "${CLEAN_TMP_DIR}" -maxdepth 1 -type f -name "${i}.*.clean_reads.tsv" | head -n 1)
-        [[ -s "${f}" ]] || die "Missing clean-count temporary result for row ${i}. Check logs in ${LOG_DIR}."
+        f=$(find "${CLEAN_TMP_DIR}" -maxdepth 1 -type f -name "${i}.*.reads_stat.tsv" | head -n 1)
+        [[ -s "${f}" ]] || die "Missing clean-count temporary result for row ${i}. Check logs in ${TASK_LOG_DIR}."
         cat "${f}" >> "${CLEAN_OUT}.tmp"
     done
     mv -f "${CLEAN_OUT}.tmp" "${CLEAN_OUT}"
-    log "Written clean counts: ${CLEAN_OUT}"
+    log "Written reads stats: ${CLEAN_OUT}"
 }
 
 # ==============================================================================
@@ -994,7 +1288,7 @@ extract_one_marker() {
     local out_r1="${MARKER_DIR}/${marker}/${sample_id}.${marker}.R1.fq.gz"
     local out_r2="${MARKER_DIR}/${marker}/${sample_id}.${marker}.R2.fq.gz"
     local stat="${MARKER_DIR}/stats/${sample_id}.${marker}.bbduk.stats.txt"
-    local log_file="${MARKER_DIR}/logs/${sample_id}.${marker}.bbduk.log"
+    local log_file="${TASK_LOG_DIR}/extract.${sample_id}.${marker}.bbduk.log"
     local done="${STATUS_DIR}/extract/${sample_id}.${marker}.done"
     local tag="${sample_id}.${marker}.$$"
     local tmp_r1="${MARKER_DIR}/tmp/${tag}.R1.fq.gz.tmp"
@@ -1007,12 +1301,13 @@ extract_one_marker() {
     fi
 
     rm -f "${tmp_r1}" "${tmp_r2}" "${tmp_stat}"
-    local cmd=(bbduk.sh "-Xmx${BBMAP_MEM}" "in1=${r1_path}" "in2=${r2_path}" "outm1=${tmp_r1}" "outm2=${tmp_r2}" "ref=${ref}" "k=${k}" "hdist=${hdist}" "mkh=${mkh}" "t=${THREADS_PER_SAMPLE}" "ordered=t" "stats=${tmp_stat}")
+    local cmd=(bbduk.sh "-Xmx${BBMAP_MEM}" "in1=${r1_path}" "in2=${r2_path}" "outm1=${tmp_r1}" "outm2=${tmp_r2}" "ref=${ref}" "k=${k}" "hdist=${hdist}" "mkh=${mkh}" "t=${BBDUK_THREADS}" "ordered=t" "stats=${tmp_stat}")
     if [[ "${mink}" -gt 0 ]]; then
         cmd+=("mink=${mink}")
     fi
 
     echo "[$(ts)] [INFO] extract start: ${sample_id} ${marker}" > "${log_file}"
+    record_command extract "${sample_id}" "${cmd[@]}"
     { printf '[%s] [CMD]' "$(ts)"; printf ' %q' "${cmd[@]}"; printf '\n'; } >> "${log_file}"
 
     "${cmd[@]}" >> "${log_file}" 2>&1
@@ -1022,6 +1317,7 @@ extract_one_marker() {
     mv -f "${tmp_stat}" "${stat}"
     printf 'sample_id=%s\tmarker=%s\tout_r1=%s\tout_r2=%s\n' "${sample_id}" "${marker}" "${out_r1}" "${out_r2}" > "${done}"
     echo "[$(ts)] [INFO] extract done: ${sample_id} ${marker}" >> "${log_file}"
+    [[ "${KEEP_TASK_LOGS}" -eq 0 ]] && rm -f "${log_file}"
 }
 
 extract_one_sample() {
@@ -1034,13 +1330,32 @@ extract_one_sample() {
 }
 
 run_extract() {
-    log_step "Step extract: extracting marker reads with BBDuk"
+    log_step "Step 02 extract: marker candidate reads with BBDuk"
+    if [[ "${FORCE}" -eq 1 || "${RESUME}" -eq 0 ]]; then
+        rm -f "${STATUS_DIR}/extract"/*.done 2>/dev/null || true
+    fi
     export REF_16S REF_18S REF_ITS K_16S HDIST_16S MKH_16S MINK_16S K_18S HDIST_18S MKH_18S MINK_18S K_ITS HDIST_ITS MKH_ITS MINK_ITS
-    export MARKER_DIR STATUS_DIR THREADS_PER_SAMPLE BBMAP_MEM FORCE RESUME MARKERS
-    export -f ts for_each_marker marker_ref marker_k marker_hdist marker_mkh marker_mink extract_one_marker extract_one_sample
+    export MARKER_DIR STATUS_DIR TASK_LOG_DIR COMMAND_DIR BBDUK_THREADS BBMAP_MEM FORCE RESUME MARKERS KEEP_TASK_LOGS
+    export -f ts record_command for_each_marker marker_ref marker_k marker_hdist marker_mkh marker_mink extract_one_marker extract_one_sample
 
-    awk -F '\t' 'NR>1 && NF>=6 { printf "%s%c%s%c%s%c%s%c%s%c%s%c", $1,0,$2,0,$3,0,$4,0,$5,0,$6,0 }' "${MANIFEST}" \
-        | xargs -0 -r -P "${JOBS}" -n 6 bash -euo pipefail -c 'extract_one_sample "$@"' _
+    local sample_count marker_total task_total worker_pid
+    sample_count=$(awk -F '\t' 'NR>1 && NF>=6 {n++} END{print n+0}' "${MANIFEST}")
+    marker_total=$(marker_count_n)
+    task_total=$((sample_count * marker_total))
+    EXTRACT_JOBS="$(calc_step_jobs "${sample_count}" "${BBDUK_THREADS}")"
+    log "Step extract parallelism: jobs=${EXTRACT_JOBS}, bbduk_threads=${BBDUK_THREADS}, cpu_budget=${TOTAL_THREAD_BUDGET}"
+
+    (
+        awk -F '\t' 'NR>1 && NF>=6 { printf "%s%c%s%c%s%c%s%c%s%c%s%c", $1,0,$2,0,$3,0,$4,0,$5,0,$6,0 }' "${MANIFEST}" \
+            | xargs -0 -r -P "${EXTRACT_JOBS}" -n 6 bash -euo pipefail -c 'extract_one_sample "$@"' _
+    ) &
+    worker_pid=$!
+    if ! progress_watch "extract" "${task_total}" "${STATUS_DIR}/extract" "*.done" "${worker_pid}"; then
+        log_error "extract failed. Showing the last lines of per-sample logs:"
+        find "${TASK_LOG_DIR}" -maxdepth 1 -type f -name 'extract.*.log' -print0 \
+            | xargs -0 -r tail -n 30 >&2 || true
+        die "Step extract failed. Failed task logs are in ${TASK_LOG_DIR}"
+    fi
     log "Step extract finished"
 }
 
@@ -1062,7 +1377,7 @@ align_one_marker() {
     [[ -e "${in_r2}" ]] || { echo "[$(ts)] [ERROR] Missing marker R2: ${in_r2}" >&2; return 1; }
 
     if [[ "${FORCE}" -eq 0 && "${RESUME}" -eq 1 && -e "${out_r1}" && -e "${out_r2}" && -s "${done}" ]]; then
-        echo "[$(ts)] [INFO] align skip: ${sample_id} ${marker}" >> "${ALIGN_DIR}/logs/${sample_id}.${marker}.minimap2.log"
+        echo "[$(ts)] [INFO] align skip: ${sample_id} ${marker}" >> "${TASK_LOG_DIR}/align.${sample_id}.${marker}.minimap2.log"
         return 0
     fi
 
@@ -1070,7 +1385,7 @@ align_one_marker() {
     for mate in R1 R2; do
         if [[ "${mate}" == "R1" ]]; then fq="${in_r1}"; out="${out_r1}"; else fq="${in_r2}"; out="${out_r2}"; fi
         tmp="${ALIGN_DIR}/tmp/${sample_id}.${marker}.${mate}.$$.paf.tmp"
-        log_file="${ALIGN_DIR}/logs/${sample_id}.${marker}.${mate}.minimap2.log"
+        log_file="${TASK_LOG_DIR}/align.${sample_id}.${marker}.${mate}.minimap2.log"
 
         if [[ "${FORCE}" -eq 0 && "${RESUME}" -eq 1 && -e "${out}" ]]; then
             echo "[$(ts)] [INFO] align skip existing: ${out}" >> "${log_file}"
@@ -1078,13 +1393,19 @@ align_one_marker() {
         fi
 
         echo "[$(ts)] [INFO] align start: ${sample_id} ${marker} ${mate}" > "${log_file}"
-        echo "[$(ts)] [CMD] minimap2 -x ${MINIMAP2_PRESET} -N ${MINIMAP2_N} -t ${THREADS_PER_SAMPLE} ${index} ${fq}" >> "${log_file}"
-        minimap2 -x "${MINIMAP2_PRESET}" -N "${MINIMAP2_N}" -t "${THREADS_PER_SAMPLE}" "${index}" "${fq}" > "${tmp}" 2>> "${log_file}"
+        local cmd=(minimap2 -x "${MINIMAP2_PRESET}" -N "${MINIMAP2_N}" -t "${MINIMAP2_THREADS}" "${index}" "${fq}")
+        record_command align "${sample_id}" "${cmd[@]}"
+        { printf '[%s] [CMD]' "$(ts)"; printf ' %q' "${cmd[@]}"; printf '\n'; } >> "${log_file}"
+        if ! "${cmd[@]}" > "${tmp}" 2>> "${log_file}"; then
+            printf '[%s] [ERROR] align failed: %s %s %s  log=%s\n' "$(ts)" "${sample_id}" "${marker}" "${mate}" "${log_file}" >&2
+            return 1
+        fi
         mv -f "${tmp}" "${out}"
         echo "[$(ts)] [INFO] align done: ${out}" >> "${log_file}"
     done
 
     printf 'sample_id=%s\tmarker=%s\tout_r1=%s\tout_r2=%s\n' "${sample_id}" "${marker}" "${out_r1}" "${out_r2}" > "${done}"
+    [[ "${KEEP_TASK_LOGS}" -eq 0 ]] && rm -f "${TASK_LOG_DIR}/align.${sample_id}.${marker}."*.minimap2.log "${TASK_LOG_DIR}/align.${sample_id}.${marker}.minimap2.log" 2>/dev/null || true
 }
 
 align_one_sample() {
@@ -1095,12 +1416,31 @@ align_one_sample() {
 }
 
 run_align() {
-    log_step "Step align: aligning marker reads with minimap2"
-    export INDEX_16S INDEX_18S INDEX_ITS MARKER_DIR ALIGN_DIR STATUS_DIR THREADS_PER_SAMPLE FORCE RESUME MARKERS MINIMAP2_PRESET MINIMAP2_N
-    export -f ts for_each_marker marker_index align_one_marker align_one_sample
+    log_step "Step 03 align: marker reads with minimap2"
+    if [[ "${FORCE}" -eq 1 || "${RESUME}" -eq 0 ]]; then
+        rm -f "${STATUS_DIR}/align"/*.done 2>/dev/null || true
+    fi
+    export INDEX_16S INDEX_18S INDEX_ITS MARKER_DIR ALIGN_DIR STATUS_DIR TASK_LOG_DIR COMMAND_DIR FORCE RESUME MARKERS MINIMAP2_PRESET MINIMAP2_N MINIMAP2_THREADS KEEP_TASK_LOGS
+    export -f ts record_command for_each_marker marker_index align_one_marker align_one_sample
 
-    awk -F '\t' 'NR>1 && NF>=6 { printf "%s%c%s%c%s%c%s%c%s%c%s%c", $1,0,$2,0,$3,0,$4,0,$5,0,$6,0 }' "${MANIFEST}" \
-        | xargs -0 -r -P "${JOBS}" -n 6 bash -euo pipefail -c 'align_one_sample "$@"' _
+    local sample_count marker_total task_total worker_pid
+    sample_count=$(awk -F '\t' 'NR>1 && NF>=6 {n++} END{print n+0}' "${MANIFEST}")
+    marker_total=$(marker_count_n)
+    task_total=$((sample_count * marker_total))
+    ALIGN_JOBS="$(calc_step_jobs "${sample_count}" "${MINIMAP2_THREADS}")"
+    log "Step align parallelism: jobs=${ALIGN_JOBS}, minimap2_threads=${MINIMAP2_THREADS}, cpu_budget=${TOTAL_THREAD_BUDGET}"
+
+    (
+        awk -F '\t' 'NR>1 && NF>=6 { printf "%s%c%s%c%s%c%s%c%s%c%s%c", $1,0,$2,0,$3,0,$4,0,$5,0,$6,0 }' "${MANIFEST}" \
+            | xargs -0 -r -P "${ALIGN_JOBS}" -n 6 bash -euo pipefail -c 'align_one_sample "$@"' _
+    ) &
+    worker_pid=$!
+    if ! progress_watch "align" "${task_total}" "${STATUS_DIR}/align" "*.done" "${worker_pid}"; then
+        log_error "align failed. Showing the last lines of per-sample logs:"
+        find "${TASK_LOG_DIR}" -maxdepth 1 -type f -name 'align.*.log' -print0 \
+            | xargs -0 -r tail -n 30 >&2 || true
+        die "Step align failed. Failed task logs are in ${TASK_LOG_DIR}"
+    fi
     log "Step align finished"
 }
 
@@ -1136,6 +1476,7 @@ TOP_ALN_LEN_DIFF=10
 ats() { date '+%Y-%m-%d %H:%M:%S'; }
 alog() {
     local level="$1"; shift
+    [[ "$#" -gt 0 && -n "${1:-}" ]] || return 0
     printf '[%s] [%s] %s\n' "$(ats)" "${level}" "$*" >&2
 }
 
@@ -1178,8 +1519,6 @@ mkdir -p "$(dirname "${OUTPUT_PREFIX}")"
 run_rank() {
     local rank="$1"
     local long_out="${OUTPUT_PREFIX}.${rank}.long.tsv"
-    local matrix_out="${OUTPUT_PREFIX}.${rank}.matrix.tsv"
-    local domain_out="${OUTPUT_PREFIX}.${rank}.domain_total.tsv"
     local stats_out="${OUTPUT_PREFIX}.${rank}.assignment_stats.tsv"
 
     awk \
@@ -1190,8 +1529,6 @@ run_rank() {
         -v MARKERS="${MARKERS}" \
         -v RANK="${rank}" \
         -v LONG_OUT="${long_out}" \
-        -v MATRIX_OUT="${matrix_out}" \
-        -v DOMAIN_OUT="${domain_out}" \
         -v STATS_OUT="${stats_out}" \
         -v MIN_IDENTITY_16S="${MIN_IDENTITY_16S}" \
         -v MIN_IDENTITY_18S="${MIN_IDENTITY_18S}" \
@@ -1286,8 +1623,56 @@ function append_sample_meta(out, sid,    i,name,v) {
         printf "\t%s", v >> out
     }
 }
-function read_taxonomy(    line,n,a,path,col,ref) {
+function print_additional_meta_header(out,    i) {
+    for (i=1; i<=meta_n; i++) printf "\t%s", meta_name[i] >> out
+}
+function append_additional_meta(out, sid,    i,name,v) {
+    for (i=1; i<=meta_n; i++) {
+        name = meta_name[i]
+        v = sample_meta[sid SUBSEP name]
+        if (v == "") v = "NA"
+        printf "\t%s", v >> out
+    }
+}
+function rank_level(rank) {
+    if (rank == "domain") return 0
+    if (rank == "phylum") return 1
+    if (rank == "class") return 2
+    if (rank == "order") return 3
+    if (rank == "family") return 4
+    if (rank == "genus") return 5
+    if (rank == "species") return 6
+    return 5
+}
+function rank_value(ref, rank) {
+    if (rank == "phylum") return tax_phylum[ref]
+    if (rank == "class") return tax_class[ref]
+    if (rank == "order") return tax_order[ref]
+    if (rank == "family") return tax_family[ref]
+    if (rank == "genus") return tax_genus[ref]
+    if (rank == "species") return tax_species[ref]
+    return "Unclassified"
+}
+function build_lineage(ref, rank,    max_i,i,r,v,line) {
+    max_i = rank_level(rank)
+    line = tax_domain[ref]
+    if (max_i <= 0) return clean_value(line)
+    for (i=1; i<=max_i; i++) {
+        r = rank_order[i]
+        v = clean_value(rank_value(ref, r))
+        line = line ";" v
+    }
+    return clean_value(line)
+}
+function read_taxonomy(    line,n,a,path,col,ref,raw_lineage) {
     path = TAXONOMY
+    rank_order[1] = "phylum"
+    rank_order[2] = "class"
+    rank_order[3] = "order"
+    rank_order[4] = "family"
+    rank_order[5] = "genus"
+    rank_order[6] = "species"
+
     read_tsv_header(path, col)
     getline line < path
     if (!("ref_id" in col) || !("marker" in col) || !("domain" in col)) {
@@ -1300,7 +1685,18 @@ function read_taxonomy(    line,n,a,path,col,ref) {
         ref = a[col["ref_id"]]
         tax_marker[ref] = a[col["marker"]]
         tax_domain[ref] = clean_value(a[col["domain"]])
-        tax_rank[ref] = ((RANK in col) ? clean_value(a[col[RANK]]) : "Unclassified")
+        tax_phylum[ref] = (("phylum" in col) ? clean_value(a[col["phylum"]]) : "Unclassified")
+        tax_class[ref] = (("class" in col) ? clean_value(a[col["class"]]) : "Unclassified")
+        tax_order[ref] = (("order" in col) ? clean_value(a[col["order"]]) : "Unclassified")
+        tax_family[ref] = (("family" in col) ? clean_value(a[col["family"]]) : "Unclassified")
+        tax_genus[ref] = (("genus" in col) ? clean_value(a[col["genus"]]) : "Unclassified")
+        tax_species[ref] = (("species" in col) ? clean_value(a[col["species"]]) : "Unclassified")
+        tax_rank[ref] = (RANK == "domain" ? tax_domain[ref] : ((RANK in col) ? clean_value(a[col[RANK]]) : "Unclassified"))
+        tax_lineage[ref] = build_lineage(ref, RANK)
+        if ((tax_lineage[ref] == "Unclassified" || tax_lineage[ref] ~ /;Unclassified$/) && ("lineage" in col)) {
+            raw_lineage = clean_value(a[col["lineage"]])
+            if (raw_lineage != "Unclassified") tax_lineage[ref] = raw_lineage
+        }
     }
     close(path)
 }
@@ -1314,35 +1710,52 @@ function parse_markers(    n,i,a,m) {
 function paf_file(sid, marker, mate) {
     return ALIGN_DIR "/" marker "/" sid "." marker "." mate ".paf"
 }
+function normalize_read_id(qname) {
+    sub(/ .*/, "", qname)
+    sub(/\/[12]$/, "", qname)
+    return qname
+}
 function reset_sample_marker(    k) {
     for (k in hit_count) delete hit_count[k]
     for (k in hit_id) delete hit_id[k]
     for (k in hit_aln) delete hit_aln[k]
     for (k in hit_matches) delete hit_matches[k]
     for (k in hit_mapq) delete hit_mapq[k]
+    for (k in hit_qcov) delete hit_qcov[k]
+    for (k in hit_tlen) delete hit_tlen[k]
+    for (k in hit_tname) delete hit_tname[k]
+    for (k in hit_mate) delete hit_mate[k]
     for (k in hit_domain) delete hit_domain[k]
+    for (k in hit_lineage) delete hit_lineage[k]
     for (k in hit_taxon) delete hit_taxon[k]
     for (k in read_seen) delete read_seen[k]
+    for (k in pair_seen) delete pair_seen[k]
+    for (k in count_reads) delete count_reads[k]
+    for (k in count_tlen_sum) delete count_tlen_sum[k]
     total_alignments = 0
     passed_alignments = 0
     reads_with_passed_hits = 0
+    read_pairs_with_passed_hits = 0
     assigned_reads = 0
+    discordant_pairs = 0
+    reassigned_discordant_reads = 0
+    tie_broken_reads = 0
     ambiguous_reads = 0
 }
-function collect_paf(path, marker, mate,    line,a,n,qname,qlen,qstart,qend,tname,matches,aln_len,mapq,id,qcov,idx,key) {
+function collect_paf(path, marker, mate,    line,a,n,qname,qlen,qstart,qend,tname,tlen,matches,aln_len,mapq,id,qcov,idx,key,read_key) {
     while ((getline line < path) > 0) {
         trim_cr(line)
         if (line == "") continue
         n = split(line, a, "\t")
         if (n < 12) continue
         total_alignments++
-        qname = mate "::" a[1]
-        sub(/ .*/, "", qname)
+        qname = normalize_read_id(a[1])
         qlen = a[2] + 0
         qstart = a[3] + 0
         qend = a[4] + 0
         tname = a[6]
         sub(/ .*/, "", tname)
+        tlen = a[7] + 0
         matches = a[10] + 0
         aln_len = a[11] + 0
         mapq = a[12] + 0
@@ -1356,7 +1769,9 @@ function collect_paf(path, marker, mate,    line,a,n,qname,qlen,qstart,qend,tnam
         if (qcov < marker_min_qcov(marker)) continue
         if (mapq < MIN_MAPQ) continue
         passed_alignments++
-        if (!(qname in read_seen)) { read_seen[qname] = 1; reads_with_passed_hits++ }
+        read_key = mate SUBSEP qname
+        if (!(read_key in read_seen)) { read_seen[read_key] = 1; reads_with_passed_hits++ }
+        if (!(qname in pair_seen)) { pair_seen[qname] = 1; read_pairs_with_passed_hits++ }
         hit_count[qname]++
         idx = hit_count[qname]
         key = qname SUBSEP idx
@@ -1364,41 +1779,92 @@ function collect_paf(path, marker, mate,    line,a,n,qname,qlen,qstart,qend,tnam
         hit_aln[key] = aln_len
         hit_matches[key] = matches
         hit_mapq[key] = mapq
+        hit_qcov[key] = qcov
+        hit_tlen[key] = tlen
+        hit_tname[key] = tname
+        hit_mate[key] = mate
         hit_domain[key] = tax_domain[tname]
+        hit_lineage[key] = tax_lineage[tname]
         hit_taxon[key] = tax_rank[tname]
     }
     close(path)
 }
-function assign_reads(marker, sid,    q,i,key,bid,baln,bmatches,bmapq,bestset,taxset,domset,ntax,ndom,one_tax,one_dom,ck) {
+function hit_is_better(key, bid, baln, bmatches, bmapq, bqcov, btlen, btname, bmate) {
+    if (bid < 0) return 1
+    if (hit_id[key] != bid) return (hit_id[key] > bid)
+    if (hit_aln[key] != baln) return (hit_aln[key] > baln)
+    if (hit_matches[key] != bmatches) return (hit_matches[key] > bmatches)
+    if (hit_mapq[key] != bmapq) return (hit_mapq[key] > bmapq)
+    if (hit_qcov[key] != bqcov) return (hit_qcov[key] > bqcov)
+    if (hit_tlen[key] != btlen) return (hit_tlen[key] > btlen)
+    if (hit_mate[key] != bmate) return (hit_mate[key] < bmate)
+    if (hit_tname[key] != btname) return (hit_tname[key] < btname)
+    return 0
+}
+function key_is_better(candidate, current) {
+    if (candidate == "") return 0
+    if (current == "") return 1
+    return hit_is_better(candidate, hit_id[current], hit_aln[current], hit_matches[current], hit_mapq[current], hit_qcov[current], hit_tlen[current], hit_tname[current], hit_mate[current])
+}
+function same_numeric_score(key, bid, baln, bmatches, bmapq, bqcov, btlen) {
+    return (hit_id[key] == bid && hit_aln[key] == baln && hit_matches[key] == bmatches && hit_mapq[key] == bmapq && hit_qcov[key] == bqcov && hit_tlen[key] == btlen)
+}
+function same_assignment(k1, k2) {
+    return (k1 != "" && k2 != "" && hit_domain[k1] == hit_domain[k2] && hit_lineage[k1] == hit_lineage[k2])
+}
+function target_len_for(key) {
+    return (hit_tlen[key] > 0 ? hit_tlen[key] : hit_aln[key])
+}
+function add_assignment(key, marker, read_weight, tlen_weight,    ck) {
+    ck = hit_domain[key] SUBSEP marker SUBSEP hit_lineage[key]
+    count_reads[ck] += read_weight
+    count_tlen_sum[ck] += tlen_weight
+    assigned_reads += read_weight
+}
+function has_conflicting_numeric_tie(q, bestkey,    i,key) {
+    for (i=1; i<=hit_count[q]; i++) {
+        key = q SUBSEP i
+        if (key == bestkey) continue
+        if (hit_mate[key] != hit_mate[bestkey]) continue
+        if (same_numeric_score(key, hit_id[bestkey], hit_aln[bestkey], hit_matches[bestkey], hit_mapq[bestkey], hit_qcov[bestkey], hit_tlen[bestkey]) && \
+            (hit_domain[key] != hit_domain[bestkey] || hit_lineage[key] != hit_lineage[bestkey])) {
+            return 1
+        }
+    }
+    return 0
+}
+function assign_reads(marker, sid,    q,i,key,r1key,r1id,r1aln,r1matches,r1mapq,r1qcov,r1tlen,r1tname,r2key,r2id,r2aln,r2matches,r2mapq,r2qcov,r2tlen,r2tname,winner) {
     for (q in hit_count) {
-        bid = -1; baln = -1; bmatches = -1; bmapq = -1
+        r1key = ""; r1id = -1; r1aln = -1; r1matches = -1; r1mapq = -1; r1qcov = -1; r1tlen = -1; r1tname = ""
+        r2key = ""; r2id = -1; r2aln = -1; r2matches = -1; r2mapq = -1; r2qcov = -1; r2tlen = -1; r2tname = ""
         for (i=1; i<=hit_count[q]; i++) {
             key = q SUBSEP i
-            if (hit_id[key] > bid || \
-                (hit_id[key] == bid && hit_aln[key] > baln) || \
-                (hit_id[key] == bid && hit_aln[key] == baln && hit_matches[key] > bmatches) || \
-                (hit_id[key] == bid && hit_aln[key] == baln && hit_matches[key] == bmatches && hit_mapq[key] > bmapq)) {
-                bid = hit_id[key]; baln = hit_aln[key]; bmatches = hit_matches[key]; bmapq = hit_mapq[key]
+            if (hit_mate[key] == "R1" && hit_is_better(key, r1id, r1aln, r1matches, r1mapq, r1qcov, r1tlen, r1tname, "R1")) {
+                r1key = key; r1id = hit_id[key]; r1aln = hit_aln[key]; r1matches = hit_matches[key]; r1mapq = hit_mapq[key]; r1qcov = hit_qcov[key]; r1tlen = hit_tlen[key]; r1tname = hit_tname[key]
+            }
+            if (hit_mate[key] == "R2" && hit_is_better(key, r2id, r2aln, r2matches, r2mapq, r2qcov, r2tlen, r2tname, "R2")) {
+                r2key = key; r2id = hit_id[key]; r2aln = hit_aln[key]; r2matches = hit_matches[key]; r2mapq = hit_mapq[key]; r2qcov = hit_qcov[key]; r2tlen = hit_tlen[key]; r2tname = hit_tname[key]
             }
         }
-        delete taxset; delete domset; ntax = 0; ndom = 0
-        for (i=1; i<=hit_count[q]; i++) {
-            key = q SUBSEP i
-            if ((bid - hit_id[key]) <= TOP_IDENTITY_DIFF && (baln - hit_aln[key]) <= TOP_ALN_LEN_DIFF) {
-                if (!(hit_taxon[key] in taxset)) { taxset[hit_taxon[key]] = 1; ntax++; one_tax = hit_taxon[key] }
-                if (!(hit_domain[key] in domset)) { domset[hit_domain[key]] = 1; ndom++; one_dom = hit_domain[key] }
-            }
-        }
-        if (ntax == 1 && ndom == 1) {
-            ck = one_dom SUBSEP marker SUBSEP one_tax
-            count_reads[ck]++
-            assigned_reads++
-        } else {
-            ambiguous_reads++
+
+        if (r1key != "" && has_conflicting_numeric_tie(q, r1key)) tie_broken_reads++
+        if (r2key != "" && has_conflicting_numeric_tie(q, r2key)) tie_broken_reads++
+
+        if (r1key != "" && r2key != "" && same_assignment(r1key, r2key)) {
+            add_assignment(r1key, marker, 2, target_len_for(r1key) + target_len_for(r2key))
+        } else if (r1key != "" && r2key != "") {
+            discordant_pairs++
+            winner = (key_is_better(r2key, r1key) ? r2key : r1key)
+            add_assignment(winner, marker, 2, target_len_for(winner) * 2)
+            reassigned_discordant_reads++
+        } else if (r1key != "") {
+            add_assignment(r1key, marker, 1, target_len_for(r1key))
+        } else if (r2key != "") {
+            add_assignment(r2key, marker, 1, target_len_for(r2key))
         }
     }
 }
-function process_sample_marker(sid, marker,    r1,r2,ck,a,domain,taxon,nreads,rpm,fid,dkey) {
+function process_sample_marker(sid, marker,    r1,r2,ck,a,domain,lineage,nreads,rpm,rpkm,mean_tlen) {
     reset_sample_marker()
     r1 = paf_file(sid, marker, "R1")
     r2 = paf_file(sid, marker, "R2")
@@ -1407,23 +1873,20 @@ function process_sample_marker(sid, marker,    r1,r2,ck,a,domain,taxon,nreads,rp
     assign_reads(marker, sid)
 
     append_sample_meta(STATS_OUT, sid)
-    printf "\t%s\t%d\t%d\t%d\t%d\t%d\n", marker, total_alignments, passed_alignments, reads_with_passed_hits, assigned_reads, ambiguous_reads >> STATS_OUT
+    printf "\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", marker, total_alignments, passed_alignments, reads_with_passed_hits, read_pairs_with_passed_hits, assigned_reads, discordant_pairs, reassigned_discordant_reads, tie_broken_reads, ambiguous_reads >> STATS_OUT
 
     for (ck in count_reads) {
         split(ck, a, SUBSEP)
-        domain = a[1]; marker = a[2]; taxon = a[3]
+        domain = a[1]; marker = a[2]; lineage = a[3]
         nreads = count_reads[ck]
+        mean_tlen = (nreads > 0 ? count_tlen_sum[ck] / nreads : 0)
         rpm = (clean_total[sid] > 0 ? nreads / clean_total[sid] * 1000000 : 0)
-        append_sample_meta(LONG_OUT, sid)
-        printf "\t%s\t%s\t%s\t%s\t%d\t%d\t%.10g\n", marker, domain, RANK, taxon, nreads, clean_total[sid], rpm >> LONG_OUT
-        fid = domain "|" marker "|" RANK "__" taxon
-        if (!(fid in feature_seen)) { feature_seen[fid] = 1; feature_n++; feature_list[feature_n] = fid }
-        matrix_value[sid SUBSEP fid] += rpm
-        dkey = sid SUBSEP domain SUBSEP marker
-        domain_reads[dkey] += nreads
-        domain_rpm[dkey] += rpm
-        domain_clean[dkey] = clean_total[sid]
+        rpkm = (clean_total[sid] > 0 && mean_tlen > 0 ? nreads * 1000000000 / clean_total[sid] / mean_tlen : 0)
+        printf "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%.10g\t%.10g\t%.2f", sid, marker, domain, RANK, lineage, nreads, clean_total[sid], rpm, rpkm, mean_tlen >> LONG_OUT
+        append_additional_meta(LONG_OUT, sid)
+        printf "\n" >> LONG_OUT
         delete count_reads[ck]
+        delete count_tlen_sum[ck]
     }
 }
 BEGIN {
@@ -1433,10 +1896,11 @@ BEGIN {
     read_taxonomy()
     parse_markers()
 
-    print_meta_header(LONG_OUT)
-    print "\tmarker\tdomain\trank\ttaxon\ttaxon_marker_reads\tclean_reads_total\tmarker_rpm" >> LONG_OUT
+    printf "sample_id\tmarker\tdomain\trank\tlineage\ttaxon_marker_reads\tclean_reads_total\tmarker_rpm\tmarker_rpkm\tmean_target_length_bp" > LONG_OUT
+    print_additional_meta_header(LONG_OUT)
+    printf "\n" >> LONG_OUT
     print_meta_header(STATS_OUT)
-    print "\tmarker\ttotal_alignments\tpassed_alignments\treads_with_passed_hits\tassigned_reads\tambiguous_reads" >> STATS_OUT
+    print "\tmarker\ttotal_alignments\tpassed_alignments\treads_with_passed_hits\tread_pairs_with_passed_hits\tassigned_reads\tdiscordant_pairs\treassigned_discordant_reads\ttie_broken_reads\tambiguous_reads" >> STATS_OUT
 
     for (si=1; si<=sample_n; si++) {
         sid = sample_id[si]
@@ -1446,33 +1910,10 @@ BEGIN {
         for (mi=1; mi<=marker_n; mi++) process_sample_marker(sid, marker_list[mi])
     }
 
-    print_meta_header(MATRIX_OUT)
-    for (fi=1; fi<=feature_n; fi++) printf "\t%s", feature_list[fi] >> MATRIX_OUT
-    printf "\n" >> MATRIX_OUT
-    for (si=1; si<=sample_n; si++) {
-        sid = sample_id[si]
-        append_sample_meta(MATRIX_OUT, sid)
-        for (fi=1; fi<=feature_n; fi++) {
-            fid = feature_list[fi]
-            printf "\t%.10g", matrix_value[sid SUBSEP fid] + 0 >> MATRIX_OUT
-        }
-        printf "\n" >> MATRIX_OUT
-    }
-
-    print_meta_header(DOMAIN_OUT)
-    print "\tdomain\tmarker\tdomain_marker_reads\tclean_reads_total\tdomain_marker_rpm" >> DOMAIN_OUT
-    for (dkey in domain_reads) {
-        split(dkey, da, SUBSEP)
-        sid = da[1]
-        append_sample_meta(DOMAIN_OUT, sid)
-        printf "\t%s\t%s\t%d\t%d\t%.10g\n", da[2], da[3], domain_reads[dkey], domain_clean[dkey], domain_rpm[dkey] >> DOMAIN_OUT
-    }
 }
 ' </dev/null
 
     alog INFO "Written: ${long_out}"
-    alog INFO "Written: ${matrix_out}"
-    alog INFO "Written: ${domain_out}"
     alog INFO "Written: ${stats_out}"
 }
 
@@ -1489,14 +1930,14 @@ AWK_HELPER
 }
 
 run_abundance() {
-    log_step "Step abundance: parsing PAF and calculating marker RPM"
-    [[ -s "${CLEAN_OUT}" ]] || die "Reads-count table not found: ${CLEAN_OUT}. Run reads_count step first or provide existing file at this path."
+    log_step "Step 04 abundance: parse PAF and calculate RPM/RPKM"
+    [[ -s "${CLEAN_OUT}" ]] || die "Reads-stat table not found: ${CLEAN_OUT}. Run counting reads first or provide existing file at this path."
 
     local helper
     helper=$(write_embedded_abundance_script)
 
-    local out_prefix="${ABUND_DIR}/marker_rpm"
-    local log_file="${ABUND_DIR}/abundance.log"
+    local out_prefix="${ABUND_DIR}/all.marker_rpm"
+    local log_file="${TMP_DIR}/abundance.log"
     local expected="${out_prefix}.${RANK}.long.tsv"
     if [[ "${RANK}" == "all" ]]; then
         expected="${out_prefix}.genus.long.tsv"
@@ -1507,41 +1948,54 @@ run_abundance() {
         return 0
     fi
 
+    local abundance_cmd=(
+        "${helper}"
+        --data-path "${MANIFEST}"
+        --clean-counts "${CLEAN_OUT}"
+        --taxonomy "${TAXONOMY}"
+        --align-dir "${ALIGN_DIR}"
+        --markers "${MARKERS}"
+        --rank "${RANK}"
+        --output-prefix "${out_prefix}"
+        --min-identity-16s "${MIN_IDENTITY_16S}"
+        --min-identity-18s "${MIN_IDENTITY_18S}"
+        --min-identity-its "${MIN_IDENTITY_ITS}"
+        --min-aln-len-16s "${MIN_ALN_LEN_16S}"
+        --min-aln-len-18s "${MIN_ALN_LEN_18S}"
+        --min-aln-len-its "${MIN_ALN_LEN_ITS}"
+        --min-qcov-16s "${MIN_QCOV_16S}"
+        --min-qcov-18s "${MIN_QCOV_18S}"
+        --min-qcov-its "${MIN_QCOV_ITS}"
+        --min-mapq "${MIN_MAPQ}"
+        --top-identity-diff "${TOP_IDENTITY_DIFF}"
+        --top-aln-len-diff "${TOP_ALN_LEN_DIFF}"
+    )
+
     {
-        printf '[%s] [CMD] %q' "$(ts)" "${helper}"
-        printf ' --data-path %q' "${MANIFEST}"
-        printf ' --clean-counts %q' "${CLEAN_OUT}"
-        printf ' --taxonomy %q' "${TAXONOMY}"
-        printf ' --align-dir %q' "${ALIGN_DIR}"
-        printf ' --markers %q' "${MARKERS}"
-        printf ' --rank %q' "${RANK}"
-        printf ' --output-prefix %q' "${out_prefix}"
-        printf '\n'
+        printf '[%s] [CMD] %q \\\n' "$(ts)" "${helper}"
+        printf '  --data-path %q \\\n' "${MANIFEST}"
+        printf '  --clean-counts %q \\\n' "${CLEAN_OUT}"
+        printf '  --taxonomy %q \\\n' "${TAXONOMY}"
+        printf '  --align-dir %q \\\n' "${ALIGN_DIR}"
+        printf '  --markers %q \\\n' "${MARKERS}"
+        printf '  --rank %q \\\n' "${RANK}"
+        printf '  --output-prefix %q \\\n' "${out_prefix}"
+        printf '  --min-identity-16s %q --min-identity-18s %q --min-identity-its %q \\\n' "${MIN_IDENTITY_16S}" "${MIN_IDENTITY_18S}" "${MIN_IDENTITY_ITS}"
+        printf '  --min-aln-len-16s %q --min-aln-len-18s %q --min-aln-len-its %q \\\n' "${MIN_ALN_LEN_16S}" "${MIN_ALN_LEN_18S}" "${MIN_ALN_LEN_ITS}"
+        printf '  --min-qcov-16s %q --min-qcov-18s %q --min-qcov-its %q \\\n' "${MIN_QCOV_16S}" "${MIN_QCOV_18S}" "${MIN_QCOV_ITS}"
+        printf '  --min-mapq %q --top-identity-diff %q --top-aln-len-diff %q\n' "${MIN_MAPQ}" "${TOP_IDENTITY_DIFF}" "${TOP_ALN_LEN_DIFF}"
     } > "${log_file}"
+    record_command abundance all "${abundance_cmd[@]}"
 
-    "${helper}" \
-        --data-path "${MANIFEST}" \
-        --clean-counts "${CLEAN_OUT}" \
-        --taxonomy "${TAXONOMY}" \
-        --align-dir "${ALIGN_DIR}" \
-        --markers "${MARKERS}" \
-        --rank "${RANK}" \
-        --output-prefix "${out_prefix}" \
-        --min-identity-16s "${MIN_IDENTITY_16S}" \
-        --min-identity-18s "${MIN_IDENTITY_18S}" \
-        --min-identity-its "${MIN_IDENTITY_ITS}" \
-        --min-aln-len-16s "${MIN_ALN_LEN_16S}" \
-        --min-aln-len-18s "${MIN_ALN_LEN_18S}" \
-        --min-aln-len-its "${MIN_ALN_LEN_ITS}" \
-        --min-qcov-16s "${MIN_QCOV_16S}" \
-        --min-qcov-18s "${MIN_QCOV_18S}" \
-        --min-qcov-its "${MIN_QCOV_ITS}" \
-        --min-mapq "${MIN_MAPQ}" \
-        --top-identity-diff "${TOP_IDENTITY_DIFF}" \
-        --top-aln-len-diff "${TOP_ALN_LEN_DIFF}" \
-        >> "${log_file}" 2>&1
+    if ! "${abundance_cmd[@]}" >> "${log_file}" 2>&1; then
+        log_error "abundance failed. Last log lines:"
+        tail -n 80 "${log_file}" >&2 || true
+        die "Step abundance failed. Log: ${log_file}"
+    fi
 
-    cat "${log_file}" >&2
+    grep 'Written:' "${log_file}" | sed 's/^.*\[INFO\] //' | while IFS= read -r line; do
+        log "${line}"
+    done
     printf 'rank=%s\toutput_prefix=%s\n' "${RANK}" "${out_prefix}" > "${STATUS_DIR}/abundance/abundance.done"
     log "Step abundance finished"
 }
@@ -1550,7 +2004,7 @@ run_abundance() {
 # Summary and cleanup
 # ==============================================================================
 write_run_config() {
-    local config="${LOG_DIR}/run_config.tsv"
+    local config="${OUTDIR}/run_config.tsv"
     {
         printf 'key\tvalue\n'
         printf 'program\t%s\n' "${PROGRAM}"
@@ -1559,7 +2013,18 @@ write_run_config() {
         printf 'markers\t%s\n' "${MARKERS}"
         printf 'jobs\t%s\n' "${JOBS}"
         printf 'threads_per_sample\t%s\n' "${THREADS_PER_SAMPLE}"
+        printf 'total_thread_budget\t%s\n' "${TOTAL_THREAD_BUDGET}"
         printf 'seqkit_threads\t%s\n' "${SEQKIT_THREADS}"
+        printf 'seqkit_max_threads\t%s\n' "${SEQKIT_MAX_THREADS}"
+        printf 'bbduk_threads\t%s\n' "${BBDUK_THREADS}"
+        printf 'bbduk_max_threads\t%s\n' "${BBDUK_MAX_THREADS}"
+        printf 'minimap2_threads\t%s\n' "${MINIMAP2_THREADS}"
+        printf 'minimap2_max_threads\t%s\n' "${MINIMAP2_MAX_THREADS}"
+        printf 'reads_count_jobs\t%s\n' "${READS_COUNT_JOBS}"
+        printf 'extract_jobs\t%s\n' "${EXTRACT_JOBS}"
+        printf 'align_jobs\t%s\n' "${ALIGN_JOBS}"
+        printf 'progress_interval\t%s\n' "${PROGRESS_INTERVAL}"
+        printf 'keep_task_logs\t%s\n' "${KEEP_TASK_LOGS}"
         printf 'bbmap_mem\t%s\n' "${BBMAP_MEM}"
         printf 'ref_dir\t%s\n' "${REF_DIR}"
         printf 'ref_16s\t%s\n' "${REF_16S}"
@@ -1578,7 +2043,7 @@ write_run_config() {
 
 cleanup_tmp() {
     if [[ "${CLEAN_TMP}" -eq 1 ]]; then
-        rm -rf "${CLEAN_TMP_DIR}" "${MARKER_DIR}/tmp" "${ALIGN_DIR}/tmp"
+        rm -rf "${TMP_DIR}" "${MARKER_DIR}/tmp" "${ALIGN_DIR}/tmp"
         log "Temporary directories removed"
     fi
 }
@@ -1596,6 +2061,7 @@ main() {
     fi
     validate_args
     prepare_manifest
+    compute_step_parallelism
     write_run_config
     print_run_plan
 
