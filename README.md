@@ -23,7 +23,7 @@
 
 ## What is `meta_marker_count`?
 
-`meta_marker_count` is a Bash-based bioinformatics workflow for estimating marker-derived reads from paired-end metagenomic clean reads. It is designed for ecological comparison of bacterial, archaeal, and fungal marker signals across many samples.
+`meta_marker_count` is a Python3-based bioinformatics workflow for estimating marker-derived reads from paired-end metagenomic clean reads. It is designed for ecological comparison of bacterial, archaeal, and fungal marker signals across many samples.
 
 The pipeline:
 
@@ -61,7 +61,8 @@ Recommended repository structure:
 
 ```text
 meta_marker_count/
-├── meta_marker_count.sh              # main pipeline
+├── metamarker_profile.py             # main pipeline
+├── meta_marker_count.sh              # thin Python wrapper
 ├── scripts/
 │   ├── build_ref_files.py            # SILVA/UNITE reference builder
 │   ├── analysis_common.R             # shared R plotting/stat helpers
@@ -117,7 +118,7 @@ By default, references are expected under the cloned repository:
 Expected links:
 
 ```text
-~/bin/meta_marker_count       -> <repo>/meta_marker_count.sh
+~/bin/meta_marker_count       -> <repo>/metamarker_profile.py
 ~/bin/meta_marker_build_refs  -> <repo>/scripts/build_ref_files.py
 ```
 
@@ -142,7 +143,7 @@ source ~/.bashrc
 make check
 ```
 
-This checks the Bash pipeline, the Python reference builder, and optionally R templates if `Rscript` is available.
+This checks the Python pipeline, the Python reference builder, the thin shell wrapper, and optionally R templates if `Rscript` is available.
 
 ---
 
@@ -172,13 +173,13 @@ This refreshes links and the local reference-directory config.
 
 | Tool | Used in | Purpose |
 |---|---:|---|
-| `bash` | all steps | workflow driver |
-| `awk` | abundance | PAF parsing and table generation |
-| `sort`, `find`, `xargs` | all steps | file handling and parallel task dispatch |
-| `seqkit` | Step 01 | clean-read counting |
+| `python3` | all steps | workflow driver, scheduling, PAF parsing, table generation |
+| `polars` | Step 04 | high-throughput PAF parsing and abundance aggregation |
+| `rich`, `rich-argparse` | CLI | help text, progress display, structured logging |
 | `bbduk.sh` | Step 02 | marker candidate-read extraction |
 | `minimap2` | Step 03 | alignment to marker reference indexes |
-| `python3` | reference setup | SILVA/UNITE reference conversion |
+
+`seqkit` is optional. With `--read-count-method auto`, the pipeline uses `seqkit` when available and falls back to native Python FASTQ counting otherwise.
 
 ### Optional tools
 
@@ -192,7 +193,8 @@ This refreshes links and the local reference-directory config.
 
 ```bash
 mamba create -n meta_marker_count -c conda-forge -c bioconda \
-  seqkit minimap2 bbmap python r-base r-ggplot2 r-vegan r-igraph
+  python polars rich rich-argparse seqkit minimap2 bbmap \
+  r-base r-ggplot2 r-vegan r-igraph
 
 mamba activate meta_marker_count
 ```
@@ -355,12 +357,6 @@ sample_id	year	month	depth	site_type	r1_path	r2_path
 202311_MF1_10-20	2023	11	10-20	MF	/data/202311_MF1_10-20_R1.fq.gz	/data/202311_MF1_10-20_R2.fq.gz
 ```
 
-Check the parsed input format:
-
-```bash
-meta_marker_count --print-format
-```
-
 ---
 
 ## Run the pipeline
@@ -483,7 +479,9 @@ Output:
 
 ### Step 03 — align marker reads
 
-Uses `minimap2` to align extracted marker reads to marker indexes and writes PAF files.
+Uses one `minimap2` process per sample-marker task to align extracted R1/R2 reads together and writes a paired PAF file. Query IDs are normalized internally to `/1` and `/2` mate suffixes so minimap2 can recognize PE pairing and the Polars parser can arbitrate mates from one PAF.
+
+PAF is used because this workflow quantifies marker-read support and taxonomic assignment, not insert-size or genome-coordinate paired-end evidence.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -496,15 +494,13 @@ Output:
 
 ```text
 03_align/
-├── 16S/<sample>.16S.R1.paf
-├── 16S/<sample>.16S.R2.paf
-├── ITS/<sample>.ITS.R1.paf
-└── ITS/<sample>.ITS.R2.paf
+├── 16S/<sample>.16S.pe.paf
+└── ITS/<sample>.ITS.pe.paf
 ```
 
 ### Step 04 — assign taxonomy and calculate abundance
 
-Parses PAF files, filters alignments, assigns each read pair to the single best PAF hit, and writes long/stat tables.
+Parses paired PAF files, filters alignments, assigns each read pair to the single best PAF hit, and writes long/stat tables.
 
 | Option | 16S default | 18S default | ITS default | Meaning |
 |---|---:|---:|---:|---|
@@ -512,8 +508,6 @@ Parses PAF files, filters alignments, assigns each read pair to the single best 
 | `--min-aln-len-*` | `80` | `80` | `80` | minimum aligned length |
 | `--min-qcov-*` | `0.60` | `0.60` | `0.60` | minimum query coverage |
 | `--min-mapq` | colspan | colspan | `0` | minimum MAPQ |
-| `--top-identity-diff` | colspan | colspan | `0.010` | legacy compatibility option |
-| `--top-aln-len-diff` | colspan | colspan | `10` | legacy compatibility option |
 | `--rank` | colspan | colspan | `genus` | `domain,phylum,class,order,family,genus,species,all` |
 
 Best-hit assignment order:
@@ -547,7 +541,10 @@ Output:
 ```text
 all.marker_rpm.<rank>.long.tsv
 all.marker_rpm.<rank>.assignment_stats.tsv
+all.marker_rpm.assignment_qc.tsv
 ```
+
+`assignment_stats` preserves raw assignment counts per requested rank. `assignment_qc` is a rank-independent diagnostic table with rates derived from the same counts; it is not used to filter results.
 
 ---
 
@@ -585,7 +582,9 @@ Thread scheduling:
 ```text
 CPU budget = jobs × threads-per-sample
 effective tool threads = min(tool request, tool cap)
-step sample parallelism = floor(CPU budget / effective tool threads)
+reads_count parallelism = floor(CPU budget / seqkit threads)
+extract/align parallelism = floor(CPU budget / tool threads), scheduled by sample-marker task
+abundance parallelism = floor(CPU budget / Polars threads)
 ```
 
 Example for a 40-core node:
@@ -611,7 +610,6 @@ With this example, seqkit uses up to 4 threads, while BBDuk/minimap2 use up to 1
 | `--dry-run` | validate inputs and print run plan only |
 | `--check-deps` | check external tools and exit |
 | `--keep-task-logs` | keep per-sample logs even when tasks succeed |
-| `--progress-interval INT` | seconds between progress refreshes; default `5` |
 
 ---
 
@@ -632,6 +630,7 @@ marker_count_out/
 ├── reads_stat.tsv
 ├── all.marker_rpm.genus.long.tsv
 ├── all.marker_rpm.genus.assignment_stats.tsv
+├── all.marker_rpm.assignment_qc.tsv
 ├── 02_marker_reads/
 │   ├── 16S/
 │   ├── 18S/
@@ -653,10 +652,11 @@ marker_count_out/
 |---|---|
 | `sample_manifest.tsv` | parsed and standardized sample manifest |
 | `run_config.tsv` | run-time parameters and resolved reference paths |
-| `commands/` | re-runnable command lines grouped by stage and sample |
+| `commands/` | executed command lines grouped by stage and sample |
 | `reads_stat.tsv` | read-pair counts and clean-read totals |
 | `all.marker_rpm.<rank>.long.tsv` | tidy long abundance table |
 | `all.marker_rpm.<rank>.assignment_stats.tsv` | alignment filtering, paired-end discordance, reassigned discordant reads, tie-breaking, and assignment statistics |
+| `all.marker_rpm.assignment_qc.tsv` | rank-independent diagnostic rates for alignment pass rate, assignment rate, and paired-end discordance |
 
 ### Long-table columns
 
@@ -674,6 +674,8 @@ mean_target_length_bp
 <additional sample metadata columns>
 ```
 
+Taxonomy values with empty rank fields are reported as `unidentified`; missing domains are reported as `NA`.
+
 ---
 
 ## Logging and progress
@@ -682,9 +684,9 @@ The screen output is designed for HPC runs:
 
 - dependency checks are printed once at the beginning;
 - long-running steps use progress bars;
-- re-runnable command lines are always preserved under `commands/`;
+- executed command lines are preserved under `commands/`;
 - successful task logs are removed by default;
-- failed task logs are preserved under `.tmp/task_logs/`;
+- failed sample or sample-marker task logs are preserved under `.tmp/task_logs/`;
 - the main log is kept as `meta_marker_count.YYYYmmdd_HHMMSS.log`.
 
 Example:
@@ -742,36 +744,11 @@ Figures use a shared clean theme and restrained palette from `scripts/analysis_c
 | Taxa over time/space | `scripts/taxa_time_rank_spacetime.R` | target taxa dynamics, rank diversity | long-table summaries |
 | Disturbance response | `scripts/disturbance_event_response.R` | event PERMANOVA, env tests, focal taxa models | longitudinal screening |
 
-### Matrix input example
-
-```tsv
-sample_id	year	month	depth	Bacteria|16S|genus__Vibrio	Fungi|ITS|genus__Fusarium
-S1	2023	11	00-10	12.5	3.2
-S2	2023	11	10-20	0.0	8.1
-```
-
 ### Long-table input example
 
 ```tsv
 sample_id	marker	domain	rank	lineage	taxon_marker_reads	clean_reads_total	marker_rpm	marker_rpkm
 S1	16S	Bacteria	genus	Bacteria;p__Pseudomonadota;g__Vibrio	20	1000000	20	0.13
-```
-
-### Example: diversity analysis
-
-This example assumes a sample-by-feature matrix prepared from `all.marker_rpm.genus.long.tsv`.
-
-```r
-MC_CONFIG <- list(
-  table = "marker_count_out/all.marker_rpm.genus.matrix.tsv",
-  metadata = "",
-  `table-format` = "sample_rows",
-  `metadata-cols` = "year,month,depth,site_type",
-  group = "site_type",
-  covariates = "year,month",
-  strata = "",
-  outdir = "analysis_out/diversity_genus"
-)
 ```
 
 ### Example: taxa time-space analysis
@@ -798,10 +775,11 @@ MC_CONFIG <- list(
 Important caveats:
 
 - RPM normalizes by sequencing depth but not by marker copy number.
-- `marker_rpkm` adds reference-length normalization, but it is still not a genome-copy correction.
-- 16S, 18S, and ITS have different biological and technical properties; compare markers carefully.
+- `marker_rpkm` is an RPKM-like reference-length normalization, not a genome-copy correction.
+- 16S, 18S, and ITS have different biological and technical properties; interpret abundances within marker type rather than as direct cross-marker abundance comparisons.
 - ITS length and database coverage are uneven, so genus-level summaries are usually safer than species-level interpretation.
 - Paired reads are arbitrated before counting; R1/R2 conflicts are counted in `discordant_pairs`, and both mates follow the better mate classification.
+- `all.marker_rpm.assignment_qc.tsv` reports diagnostic rates only. It does not apply or recommend ecological filtering.
 - For time series or spatial designs, use metadata-aware statistical models rather than simple group means only.
 
 Recommended reporting:
@@ -846,18 +824,14 @@ Use progress output and inspect failed logs:
 ls marker_count_out/.tmp/task_logs
 ```
 
-For debugging:
-
-```bash
---keep-task-logs --progress-interval 2
-```
+For debugging, rerun with `--keep-task-logs`.
 
 ### Reference files are missing
 
 Check resolved paths:
 
 ```bash
-meta_marker_count --print-defaults
+meta_marker_count --input data_path.tsv --dry-run
 cat marker_count_out/run_config.tsv
 ```
 
@@ -869,13 +843,13 @@ Then rebuild references or run with:
 
 ### R scripts cannot find output tables
 
-Use the current flat output paths. Long-table based scripts can point directly to:
+Use the current flat output paths. The pipeline writes long tables, not sample-by-feature matrices. Long-table based scripts can point directly to:
 
 ```r
 `long-table` = "marker_count_out/all.marker_rpm.genus.long.tsv"
 ```
 
-Matrix-based templates need a sample-by-feature matrix prepared from the long table. Do not use the old nested path `marker_count_out/04_abundance/...`.
+Some external analyses may require their own input conversion. This pipeline does not write matrix files. Do not use the old nested path `marker_count_out/04_abundance/...`.
 
 ---
 
@@ -884,7 +858,6 @@ Matrix-based templates need a sample-by-feature matrix prepared from the long ta
 ```bash
 make check
 meta_marker_count --check-deps
-meta_marker_count --print-defaults
 meta_marker_count --help
 ```
 

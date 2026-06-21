@@ -3,7 +3,8 @@ BINDIR ?= $(HOME)/bin
 REF_DIR ?= $(PREFIX)/refs
 REF_CONFIG ?= $(PREFIX)/.meta_marker_count_ref_dir
 
-SRC := meta_marker_count.sh
+SRC := metamarker_profile.py
+WRAPPER := meta_marker_count.sh
 REF_BUILDER := scripts/build_ref_files.py
 
 .PHONY: all install uninstall check print-paths configure-ref
@@ -26,6 +27,7 @@ configure-ref:
 	mkdir -p "$(REF_DIR)"
 	printf '%s\n' "$(abspath $(REF_DIR))" > "$(REF_CONFIG)"
 	chmod 755 "$(SRC)"
+	chmod 755 "$(WRAPPER)"
 	chmod 755 "$(REF_BUILDER)"
 
 uninstall:
@@ -33,7 +35,8 @@ uninstall:
 	rm -f "$(BINDIR)/meta_marker_build_refs"
 
 check:
-	bash -n "$(SRC)"
+	python3 -m py_compile "$(SRC)"
+	bash -n "$(WRAPPER)"
 	python3 -m py_compile "$(REF_BUILDER)"
 	@if command -v Rscript >/dev/null 2>&1; then \
 		Rscript -e 'files <- list.files("scripts", pattern="[.]R$$", full.names=TRUE); invisible(lapply(files, parse))'; \
