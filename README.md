@@ -244,6 +244,43 @@ refs/
 └── ref_taxonomy.tsv
 ```
 
+### Download raw SILVA SSURef NR99
+
+```bash
+mkdir -p raw_refs
+cd raw_refs
+
+aria2c \
+  -c \
+  -x 16 \
+  -s 16 \
+  -k 1M \
+  --file-allocation=none \
+  -o SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  "https://www.arb-silva.de/fileadmin/silva_databases/current/Exports/SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz"
+
+gzip -t SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz
+```
+
+If the SILVA FASTA contains RNA bases, convert `U/u` to `T/t` safely without overwriting the input in-place:
+
+```bash
+zcat SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
+  | awk '
+      /^>/ { print; next }
+      { gsub(/U/, "T"); gsub(/u/, "t"); print }
+    ' \
+  | gzip -c > SILVA_138.2_SSURef_NR99_tax_silva.dna.fasta.gz
+```
+
+### Download raw UNITE ITS
+
+Download the public FASTA gzip release from the UNITE repository page and save it as:
+
+```text
+UNITE_public_19.02.2025.fasta.gz
+```
+
 ### Build minimap2 indexes
 
 If the `.mmi` index files are not already present, create them from the processed FASTA files:
