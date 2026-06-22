@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build short-id marker references and taxonomy tables from SILVA/UNITE FASTA.
 
-This script prepares reference files for marker-count workflows:
+This script prepares reference files for metamarker profiling workflows:
 
   * SILVA SSURef -> DNA FASTA split into arc/bac 16S and eukaryotic 18S
   * UNITE ITS    -> short-id ITS FASTA
@@ -53,16 +53,16 @@ from rich_argparse import RichHelpFormatter
 
 PROGRAM = "build_ref_files.py"
 MISSING = "Unclassified"
-SOFTWARE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_REF_CONFIG = Path.home() / ".config" / "metamarker_profile" / "ref_dir"
 
 
 def default_ref_dir() -> Path:
-    env_ref = os.environ.get("META_MARKER_COUNT_REF_DIR")
+    env_ref = os.environ.get("METAMARKER_PROFILE_REF_DIR")
     if env_ref:
         return Path(env_ref)
 
     config_path = Path(
-        os.environ.get("META_MARKER_COUNT_REF_CONFIG", SOFTWARE_DIR / ".meta_marker_count_ref_dir")
+        os.environ.get("METAMARKER_PROFILE_REF_CONFIG", DEFAULT_REF_CONFIG)
     )
     if config_path.is_file():
         for raw_line in config_path.read_text(encoding="utf-8").splitlines():
@@ -70,9 +70,9 @@ def default_ref_dir() -> Path:
             if not line:
                 continue
             path = Path(line)
-            return path if path.is_absolute() else SOFTWARE_DIR / path
+            return path if path.is_absolute() else Path.cwd() / path
 
-    return SOFTWARE_DIR / "refs"
+    return Path.cwd() / "refs"
 
 
 DEFAULT_REF_DIR = default_ref_dir()
@@ -1022,7 +1022,7 @@ def positive_float(value: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
-        description="Generate short-id FASTA and taxonomy TSV files for marker-count workflows.",
+        description="Generate short-id FASTA and taxonomy TSV files for metamarker profiling workflows.",
         formatter_class=RichHelpFormatter,
     )
     input_group = parser.add_argument_group("Input databases")

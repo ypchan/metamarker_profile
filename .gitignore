@@ -11,7 +11,9 @@ __pycache__/
 # Local environments
 .venv/
 .env
-.meta_marker_count_ref_dir
+build/
+dist/
+*.egg-info/
 
 # R session files
 .Rhistory
@@ -19,7 +21,7 @@ __pycache__/
 Rplots.pdf
 
 # Pipeline outputs
-marker_count_out/
+metamarker_profile_out/
 analysis_out/
 
 # Large downloaded/generated references

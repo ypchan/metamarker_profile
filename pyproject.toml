@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metamarker-profile"
+version = "0.1.0"
+description = "Marker-read profiling workflow for paired-end metagenomic clean reads."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "polars",
+  "rich",
+  "rich-argparse",
+]
+
+[project.scripts]
+metamarker_profile = "metamarker_profile.cli:run"
+
+[tool.setuptools]
+packages = ["metamarker_profile"]

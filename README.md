@@ -1,4 +1,4 @@
-# meta_marker_count
+# metamarker_profile
 
 <p align="center">
   <b>Fast marker-read quantification for metagenomic paired-end clean reads</b><br>
@@ -17,9 +17,9 @@
 
 ---
 
-## What is `meta_marker_count`?
+## What is `metamarker_profile`?
 
-`meta_marker_count` is a Python3-based bioinformatics workflow for estimating marker-derived reads from paired-end metagenomic clean reads. It is designed for ecological comparison of bacterial, archaeal, and fungal marker signals across many samples.
+`metamarker_profile` is a Python3-based bioinformatics workflow for estimating marker-derived reads from paired-end metagenomic clean reads. It is designed for ecological comparison of bacterial, archaeal, and fungal marker signals across many samples.
 
 The pipeline:
 
@@ -56,11 +56,13 @@ Add eukaryotic SSU explicitly when needed:
 Recommended repository structure:
 
 ```text
-meta_marker_count/
-├── metamarker_profile.py             # main pipeline
-├── meta_marker_count.sh              # thin Python wrapper
+metamarker_profile/
+├── pyproject.toml                    # Python package metadata
+├── metamarker_profile/
+│   ├── cli.py                        # main pipeline
+│   └── __init__.py
 ├── scripts/
-│   ├── build_ref_files.py            # SILVA/UNITE reference builder
+│   ├── build_ref_files.py            # optional reference preparation helper
 │   ├── analysis_common.R             # shared R plotting/stat helpers
 │   ├── diversity_alpha_beta.R
 │   ├── differential_abundance_compositional.R
@@ -69,8 +71,7 @@ meta_marker_count/
 │   ├── functional_profile_analysis.R
 │   ├── taxa_time_rank_spacetime.R
 │   └── disturbance_event_response.R
-├── refs/                             # generated reference FASTA/index/taxonomy files
-├── Makefile
+├── refs/                             # optional local reference FASTA/index/taxonomy files
 ├── README.md
 └── LICENSE
 ```
@@ -79,85 +80,91 @@ meta_marker_count/
 
 ## Installation
 
-### 1. Clone the repository
+### 1. Optional: create an environment
+
+Use a dedicated Python environment so Python dependencies do not mix with system packages:
 
 ```bash
-gh repo clone ypchan/meta_marker_count
-cd meta_marker_count
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -U pip
+```
+
+### 2. Install directly from GitHub
+
+For normal use, install the latest repository version directly with pip:
+
+```bash
+python3 -m pip install "git+https://github.com/ypchan/metamarker_profile.git"
+```
+
+### 3. Or clone and install locally
+
+```bash
+gh repo clone ypchan/metamarker_profile
+cd metamarker_profile
+python3 -m pip install .
 ```
 
 or:
 
 ```bash
-git clone https://github.com/ypchan/meta_marker_count.git
-cd meta_marker_count
+git clone https://github.com/ypchan/metamarker_profile.git
+cd metamarker_profile
+python3 -m pip install .
 ```
 
-### 2. Install command links into the user bin directory
-
-The recommended installation mode creates symbolic links in `~/bin` and keeps the real scripts inside the repository. This makes updates simple: after `git pull`, the linked commands immediately use the updated scripts.
+For development, use editable mode from the cloned repository:
 
 ```bash
-make install
+python3 -m pip install -e .
 ```
 
-By default, references are expected under the cloned repository:
-
-```text
-<repo>/refs
-```
-
-`make install` also writes `<repo>/.meta_marker_count_ref_dir` so both `meta_marker_count` and `meta_marker_build_refs` resolve the same reference directory without editing source code.
-
-Expected links:
-
-```text
-~/bin/meta_marker_count       -> <repo>/metamarker_profile.py
-~/bin/meta_marker_build_refs  -> <repo>/scripts/build_ref_files.py
-```
-
-Check them:
+Installed commands:
 
 ```bash
-ls -l ~/bin/meta_marker_count ~/bin/meta_marker_build_refs
-which meta_marker_count
-meta_marker_count --help
+which metamarker_profile
+metamarker_profile --help
 ```
 
-If `~/bin` is not in your `PATH`, add it once:
+The Python package install covers Python dependencies. External tools such as `bbduk.sh`, `minimap2`, and optionally `seqkit` still need to be available in `PATH`.
+
+### 4. Syntax check
 
 ```bash
-echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+python3 -m compileall metamarker_profile
 ```
 
-### 3. Syntax check
+This checks the installed Python package source. If `Rscript` is available, R analysis templates can be parsed separately:
 
 ```bash
-make check
+Rscript -e 'files <- list.files("scripts", pattern="[.]R$", full.names=TRUE); invisible(lapply(files, parse))'
 ```
-
-This checks the Python pipeline, the Python reference builder, the thin shell wrapper, and optionally R templates if `Rscript` is available.
 
 ---
 
 ## Update
 
-Because installation uses symbolic links, updating is usually just:
+For direct GitHub installs, upgrade with:
 
 ```bash
-cd meta_marker_count
+python3 -m pip install -U "git+https://github.com/ypchan/metamarker_profile.git"
+```
+
+For a cloned regular pip install, update after pulling new code:
+
+```bash
+cd metamarker_profile
 git pull --ff-only
-make check
+python3 -m pip install -U .
 ```
 
-If the repository was moved to a new directory, rerun:
+For an editable install, pull the repository and rerun checks:
 
 ```bash
-make install
+git pull --ff-only
+python3 -m compileall metamarker_profile
 ```
-
-This refreshes links and the local reference-directory config.
 
 ---
 
@@ -186,35 +193,42 @@ This refreshes links and the local reference-directory config.
 ### Example conda environment
 
 ```bash
-mamba create -n meta_marker_count -c conda-forge -c bioconda \
+mamba create -n metamarker_profile -c conda-forge -c bioconda \
   python polars rich rich-argparse seqkit minimap2 bbmap \
   r-base r-ggplot2 r-vegan r-igraph
 
-mamba activate meta_marker_count
+mamba activate metamarker_profile
 ```
 
 ---
 
 ## Reference database
 
-`meta_marker_count` expects a compact reference directory containing processed FASTA files, minimap2 indexes, and a combined taxonomy table.
+`metamarker_profile` expects a compact reference directory containing processed FASTA files, minimap2 indexes, and a combined taxonomy table.
 
-Default reference directory after installation:
+Default reference directory:
 
 ```text
-<repo>/refs
+./refs
 ```
 
 Reference directory resolution order:
 
-1. `META_MARKER_COUNT_REF_DIR`
-2. `<repo>/.meta_marker_count_ref_dir`
-3. `<repo>/refs`
+1. `METAMARKER_PROFILE_REF_DIR`
+2. `METAMARKER_PROFILE_REF_CONFIG`, defaulting to `~/.config/metamarker_profile/ref_dir`
+3. `./refs` in the current working directory
 
 You can always override it at runtime:
 
 ```bash
-meta_marker_count --ref-dir /path/to/refs ...
+metamarker_profile --ref-dir /path/to/refs ...
+```
+
+To set a persistent default reference directory:
+
+```bash
+mkdir -p ~/.config/metamarker_profile
+printf '%s\n' /path/to/refs > ~/.config/metamarker_profile/ref_dir
 ```
 
 ### Expected reference files
@@ -230,69 +244,9 @@ refs/
 └── ref_taxonomy.tsv
 ```
 
-### Download raw SILVA SSU
+### Build minimap2 indexes
 
-```bash
-mkdir -p raw_refs
-cd raw_refs
-
-aria2c \
-  -c \
-  -x 16 \
-  -s 16 \
-  -k 1M \
-  --file-allocation=none \
-  -o SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
-  "https://www.arb-silva.de/fileadmin/silva_databases/current/Exports/SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz"
-
-gzip -t SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz
-```
-
-If the SILVA FASTA contains RNA bases, convert `U/u` to `T/t` safely without overwriting the input in-place:
-
-```bash
-zcat SILVA_138.2_SSURef_NR99_tax_silva.fasta.gz \
-  | awk '
-      /^>/ { print; next }
-      { gsub(/U/, "T"); gsub(/u/, "t"); print }
-    ' \
-  | gzip -c > SILVA_138.2_SSURef_NR99_tax_silva.dna.fasta.gz
-```
-
-### Download raw UNITE ITS
-
-Download the public FASTA gzip release from the UNITE repository page and save it as:
-
-```text
-UNITE_public_19.02.2025.fasta.gz
-```
-
-### Build processed references
-
-From the repository root:
-
-```bash
-meta_marker_build_refs \
-  --silva raw_refs/SILVA_138.2_SSURef_NR99_tax_silva.dna.fasta.gz \
-  --unite raw_refs/UNITE_public_19.02.2025.fasta.gz \
-  --force
-```
-
-The builder writes processed FASTA files, taxonomy files, the combined `ref_taxonomy.tsv`, and minimap2 `.mmi` indexes into the configured reference directory.
-
-### Build FASTA first, indexes later
-
-Useful on clusters where index building should be submitted as a separate job:
-
-```bash
-meta_marker_build_refs \
-  --silva raw_refs/SILVA_138.2_SSURef_NR99_tax_silva.dna.fasta.gz \
-  --unite raw_refs/UNITE_public_19.02.2025.fasta.gz \
-  --skip-index \
-  --force
-```
-
-Then:
+If the `.mmi` index files are not already present, create them from the processed FASTA files:
 
 ```bash
 REF_DIR="refs"
@@ -323,7 +277,6 @@ Reference parsing rules:
 - SILVA `Eukaryota` records are treated as `18S`.
 - UNITE records are treated as `ITS`.
 - SILVA records with exact lineage item `Mitochondria` or `Chloroplast` are removed by default.
-- Use the reference builder option `--keep-organelles` only when organellar SSU reads are part of the intended analysis.
 
 ---
 
@@ -358,9 +311,9 @@ sample_id	year	month	depth	site_type	r1_path	r2_path
 ### Default 16S + ITS run
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --markers 16S,ITS \
   --rank genus \
   --jobs 4 \
@@ -370,9 +323,9 @@ meta_marker_count \
 ### 16S + 18S + ITS run
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --markers 16S,18S,ITS \
   --rank genus \
   --jobs 4 \
@@ -382,11 +335,11 @@ meta_marker_count \
 ### Single-sample run
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --sample-id 202311_MF1_00-10 \
   --r1 /data/202311_MF1_00-10_R1.fq.gz \
   --r2 /data/202311_MF1_00-10_R2.fq.gz \
-  --outdir marker_count_out
+  --outdir metamarker_profile_out
 ```
 
 ### Dry run
@@ -394,9 +347,9 @@ meta_marker_count \
 Use this before long cluster runs:
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --markers 16S,ITS \
   --dry-run
 ```
@@ -405,13 +358,13 @@ meta_marker_count \
 
 ```bash
 # only count reads
-meta_marker_count --input data_path.tsv --outdir marker_count_out --steps reads_count
+metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps reads_count
 
 # extract + align only
-meta_marker_count --input data_path.tsv --outdir marker_count_out --steps extract,align
+metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps extract,align
 
 # recompute abundance from existing PAF files
-meta_marker_count --input data_path.tsv --outdir marker_count_out --steps abundance --rank genus
+metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps abundance --rank genus
 ```
 
 ---
@@ -552,7 +505,7 @@ all.marker_rpm.assignment_qc.tsv
 | `--sample-id ID` | none | single-sample ID |
 | `--r1 FILE` | none | single-sample R1 FASTQ |
 | `--r2 FILE` | none | single-sample R2 FASTQ |
-| `--outdir DIR` | `marker_count_out` | output directory |
+| `--outdir DIR` | `metamarker_profile_out` | output directory |
 | `--steps LIST` | `all` | `reads_count,extract,align,abundance` or `all` |
 | `--markers LIST` | `16S,ITS` | marker set: `16S`, `18S`, `ITS` |
 | `--rank RANK` | `genus` | output taxonomy rank or `all` |
@@ -584,9 +537,9 @@ abundance parallelism = floor(CPU budget / Polars threads)
 Example for a 40-core node:
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --jobs 4 \
   --threads-per-sample 10 \
   --bbmap-mem 80G
@@ -612,10 +565,10 @@ With this example, seqkit uses up to 4 threads, while BBDuk/minimap2 use up to 1
 The current output layout keeps important result files directly under `OUTDIR` and stores large intermediate files in numbered directories.
 
 ```text
-marker_count_out/
+metamarker_profile_out/
 ├── sample_manifest.tsv
 ├── run_config.tsv
-├── meta_marker_count.YYYYmmdd_HHMMSS.log
+├── metamarker_profile.YYYYmmdd_HHMMSS.log
 ├── commands/
 │   ├── reads_count/
 │   ├── extract/
@@ -681,7 +634,7 @@ The screen output is designed for HPC runs:
 - executed command lines are preserved under `commands/`;
 - successful task logs are removed by default;
 - failed sample or sample-marker task logs are preserved under `.tmp/task_logs/`;
-- the main log is kept as `meta_marker_count.YYYYmmdd_HHMMSS.log`.
+- the main log is kept as `metamarker_profile.YYYYmmdd_HHMMSS.log`.
 
 Example:
 
@@ -694,9 +647,9 @@ Example:
 Keep all per-sample logs for debugging:
 
 ```bash
-meta_marker_count \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --keep-task-logs
 ```
 
@@ -749,7 +702,7 @@ S1	16S	Bacteria	genus	Bacteria;p__Pseudomonadota;g__Vibrio	20	1000000	20	0.13
 
 ```r
 MC_CONFIG <- list(
-  `long-table` = "marker_count_out/all.marker_rpm.genus.long.tsv",
+  `long-table` = "metamarker_profile_out/all.marker_rpm.genus.long.tsv",
   metadata = "metadata.tsv",
   taxa = "Vibrio,Fusarium",
   `time-col` = "month",
@@ -764,7 +717,7 @@ MC_CONFIG <- list(
 
 ## Biological interpretation notes
 
-`meta_marker_count` reports marker-derived read signals, not absolute cell counts.
+`metamarker_profile` reports marker-derived read signals, not absolute cell counts.
 
 Important caveats:
 
@@ -815,7 +768,7 @@ On shared clusters, request matching memory from the scheduler.
 Use progress output and inspect failed logs:
 
 ```bash
-ls marker_count_out/.tmp/task_logs
+ls metamarker_profile_out/.tmp/task_logs
 ```
 
 For debugging, rerun with `--keep-task-logs`.
@@ -825,8 +778,8 @@ For debugging, rerun with `--keep-task-logs`.
 Check resolved paths:
 
 ```bash
-meta_marker_count --input data_path.tsv --dry-run
-cat marker_count_out/run_config.tsv
+metamarker_profile --input data_path.tsv --dry-run
+cat metamarker_profile_out/run_config.tsv
 ```
 
 Then rebuild references or run with:
@@ -840,7 +793,7 @@ Then rebuild references or run with:
 Use the current flat output paths. The pipeline writes long tables, not sample-by-feature matrices. Long-table based scripts can point directly to:
 
 ```r
-`long-table` = "marker_count_out/all.marker_rpm.genus.long.tsv"
+`long-table` = "metamarker_profile_out/all.marker_rpm.genus.long.tsv"
 ```
 
 Some external analyses may require their own input conversion. This pipeline does not write matrix files.
@@ -850,9 +803,9 @@ Some external analyses may require their own input conversion. This pipeline doe
 ## Checks and diagnostics
 
 ```bash
-make check
-meta_marker_count --check-deps
-meta_marker_count --help
+python3 -m compileall metamarker_profile
+metamarker_profile --check-deps
+metamarker_profile --help
 ```
 
 ---

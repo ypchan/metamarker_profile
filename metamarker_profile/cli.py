@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-metamarker_profile.py
+metamarker_profile
 
 
 Workflow
@@ -36,9 +36,9 @@ External:
 
 Example
 -------
-metamarker_profile.py \
+metamarker_profile \
   --input data_path.tsv \
-  --outdir marker_count_out \
+  --outdir metamarker_profile_out \
   --markers 16S,ITS \
   --jobs 8 \
   --threads-per-sample 4
@@ -87,7 +87,7 @@ PROGRAM = Path(sys.argv[0]).name
 SILVA_REF_PREFIX = "SILVA_138.2_SSURef_NR99_tax_silva"
 UNITE_REF_PREFIX = "UNITE_public_19.02.2025"
 
-DEFAULT_OUTDIR = "marker_count_out"
+DEFAULT_OUTDIR = "metamarker_profile_out"
 DEFAULT_STEPS = "all"
 DEFAULT_MARKERS = "16S,ITS"
 DEFAULT_RANK = "genus"
@@ -228,7 +228,7 @@ def format_seconds(seconds: float) -> str:
 
 
 def setup_logger(console: Console, log_file: str, verbose: bool = False) -> logging.Logger:
-    logger = logging.getLogger("meta_marker_count")
+    logger = logging.getLogger("metamarker_profile")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -252,15 +252,20 @@ def setup_logger(console: Console, log_file: str, verbose: bool = False) -> logg
     return logger
 
 
-def resolve_script_dir() -> Path:
-    return Path(__file__).resolve().parent
+def default_ref_base() -> Path:
+    return Path.cwd()
 
 
-def read_default_ref_dir(software_dir: Path) -> str:
-    if os.environ.get("META_MARKER_COUNT_REF_DIR"):
-        return os.environ["META_MARKER_COUNT_REF_DIR"]
+def read_default_ref_dir(base_dir: Path) -> str:
+    if os.environ.get("METAMARKER_PROFILE_REF_DIR"):
+        return os.environ["METAMARKER_PROFILE_REF_DIR"]
 
-    config_file = Path(os.environ.get("META_MARKER_COUNT_REF_CONFIG", software_dir / ".meta_marker_count_ref_dir"))
+    config_file = Path(
+        os.environ.get(
+            "METAMARKER_PROFILE_REF_CONFIG",
+            Path.home() / ".config" / "metamarker_profile" / "ref_dir",
+        )
+    )
     if config_file.exists() and config_file.stat().st_size > 0:
         for raw in config_file.read_text(encoding="utf-8").splitlines():
             line = raw.split("#", 1)[0].strip()
@@ -269,9 +274,9 @@ def read_default_ref_dir(software_dir: Path) -> str:
             p = Path(line)
             if p.is_absolute():
                 return str(p)
-            return str(software_dir / p)
+            return str(base_dir / p)
 
-    return str(software_dir / "refs")
+    return str(base_dir / "refs")
 
 
 def normalize_markers(raw: str) -> List[str]:
@@ -375,7 +380,7 @@ def fmt_float(value: int | float) -> str:
 def write_command(paths: Paths, stage: str, sample_id: str, cmd: Sequence[str]) -> None:
     d = Path(paths.command_dir) / stage
     ensure_dir(d)
-    f = d / f"{sample_id}.commands.sh"
+    f = d / f"{sample_id}.commands.txt"
     with open(f, "a", encoding="utf-8") as out:
         out.write(f"# [{now()}] stage={stage} sample_id={sample_id}\n")
         out.write(f"cd {Path.cwd()}\n")
@@ -434,7 +439,7 @@ def init_paths(outdir: str) -> Paths:
         status_dir=str(out / ".checkpoints"),
         task_log_dir=str(out / ".tmp" / "task_logs"),
         command_dir=str(out / "commands"),
-        main_log=str(out / f"meta_marker_count.{timestamp}.log"),
+        main_log=str(out / f"metamarker_profile.{timestamp}.log"),
     )
 
     for d in [
@@ -552,8 +557,8 @@ def check_inputs(samples: List[Sample]) -> None:
 
 
 def read_config(args: argparse.Namespace, paths: Paths, logger: logging.Logger) -> Config:
-    software_dir = resolve_script_dir()
-    ref_dir = args.ref_dir or read_default_ref_dir(software_dir)
+    base_dir = default_ref_base()
+    ref_dir = args.ref_dir or read_default_ref_dir(base_dir)
 
     ref_16s = args.ref_16s or str(Path(ref_dir) / f"{SILVA_REF_PREFIX}.dna.arc_bac.shortid.fasta")
     ref_18s = args.ref_18s or str(Path(ref_dir) / f"{SILVA_REF_PREFIX}.dna.euk.shortid.fasta")
@@ -1548,8 +1553,8 @@ def write_run_config(cfg: Config, paths: Paths) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    software_dir = resolve_script_dir()
-    default_ref_dir = read_default_ref_dir(software_dir)
+    base_dir = default_ref_base()
+    default_ref_dir = read_default_ref_dir(base_dir)
 
     epilog = dedent(f"""
     [bold green]Default parameters[/bold green]
@@ -1597,12 +1602,12 @@ def build_parser() -> argparse.ArgumentParser:
     """)
 
     p = argparse.ArgumentParser(
-        prog="metamarker_profile.py",
+        prog="metamarker_profile",
         formatter_class=RawDescriptionRichHelpFormatter,
         description=dedent("""
         [bold]Integrated marker-read counting pipeline for paired-end clean reads.[/bold]
 
-        Python3 replacement:
+        Workflow components:
           seqkit/Python read counting
           BBDuk candidate-read extraction
           paired R1/R2 minimap2 PAF alignment
@@ -1781,18 +1786,22 @@ def main() -> None:
         table.add_row("Main log", paths.main_log)
         console.print(Panel(table, title="[bold green]Finished[/bold green]", border_style="green", expand=False))
 
-
-if __name__ == "__main__":
+def run() -> int:
     try:
         main()
+        return 0
     except BrokenPipeError:
-        sys.exit(0)
+        return 0
     except KeyboardInterrupt:
         Console(stderr=True).print("[yellow]Interrupted by user.[/yellow]")
-        sys.exit(130)
+        return 130
     except Exception as exc:
-        logger = logging.getLogger("meta_marker_count")
+        logger = logging.getLogger("metamarker_profile")
         if logger.handlers:
             logger.exception("Workflow failed")
         Console(stderr=True).print(f"[bold red]ERROR:[/bold red] {exc}")
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
