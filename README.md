@@ -416,7 +416,7 @@ Counts reads from clean FASTQ files with `seqkit` and writes `reads_stat.tsv`.
 |---|---:|---|
 | `--seqkit-threads` | `auto` | threads used by `seqkit stats` per sample |
 | `--seqkit-max-threads` | `4` | cap for seqkit threads because gzip/I/O usually bottlenecks first |
-| `--jobs` | `4` | number of samples processed in parallel |
+| `--jobs` | `4` | maximum concurrent workflow tasks |
 
 Output:
 
@@ -551,7 +551,7 @@ all.marker_rpm.assignment_qc.tsv
 
 | Option | Default | Description |
 |---|---:|---|
-| `--jobs INT` | `4` | samples processed in parallel |
+| `--jobs INT` | `4` | maximum concurrent workflow tasks |
 | `--threads-per-sample INT` | `4` | per-sample CPU budget before tool caps |
 | `--seqkit-threads INT\|auto` | `auto` | seqkit threads per sample |
 | `--seqkit-max-threads INT` | `4` | cap for seqkit threads |
@@ -566,9 +566,9 @@ Thread scheduling:
 ```text
 CPU budget = jobs × threads-per-sample
 effective tool threads = min(tool request, tool cap)
-reads_count parallelism = floor(CPU budget / seqkit threads)
-extract/align parallelism = floor(CPU budget / tool threads), scheduled by sample-marker task
-abundance parallelism = floor(CPU budget / Polars threads)
+step parallelism = min(jobs, task count, floor(CPU budget / effective tool threads))
+extract/align task count = samples × markers
+abundance task count = samples
 ```
 
 Example for a 40-core node:
@@ -582,7 +582,7 @@ metamarker_profile \
   --bbmap-mem 80G
 ```
 
-With this example, seqkit uses up to 4 threads, while BBDuk/minimap2 use up to 10 threads. If `--threads-per-sample 24` is used, BBDuk/minimap2 are capped at 12 and the remaining CPU budget is used for more sample-level parallelism.
+With this example, seqkit uses up to 4 threads, while BBDuk/minimap2 use up to 10 threads. If `--threads-per-sample 24` is used, BBDuk/minimap2 are capped at 12; increase `--jobs` explicitly to run more workflow tasks at the same time.
 
 ### Resume, overwrite, and logs
 
@@ -802,7 +802,7 @@ On shared clusters, request matching memory from the scheduler.
 
 ### The run appears stuck during extract or align
 
-Use progress output and inspect failed logs:
+Use progress output and inspect failed logs. Failed external commands also print the tail of their task log in the main error message:
 
 ```bash
 ls metamarker_profile_out/.tmp/task_logs

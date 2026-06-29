@@ -338,8 +338,36 @@ def resolve_tool_threads(label: str, requested: str, cap: int, threads_per_sampl
     return max(1, min(req, cap))
 
 
-def calc_step_jobs(sample_count: int, total_budget: int, tool_threads: int) -> int:
-    return max(1, min(sample_count, total_budget // max(1, tool_threads)))
+def calc_step_jobs(task_count: int, requested_jobs: int, total_budget: int, tool_threads: int) -> int:
+    cpu_limited_jobs = total_budget // max(1, tool_threads)
+    return max(1, min(task_count, requested_jobs, cpu_limited_jobs))
+
+
+def tail_text(path: str | Path, max_lines: int = 40, max_bytes: int = 20000) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
+    try:
+        with open(p, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+            text = fh.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"<could not read log tail: {exc}>"
+
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
+
+
+def command_failure_message(prefix: str, log_file: str | Path) -> str:
+    msg = f"{prefix}; log={log_file}"
+    tail = tail_text(log_file)
+    if tail:
+        msg += f"\n--- log tail ({log_file}) ---\n{tail}"
+    return msg
 
 
 def marker_ref(cfg: Config, marker: str) -> str:
@@ -411,7 +439,7 @@ def run_cmd(
         level = "DONE" if proc.returncode == 0 else "ERROR"
         log.write(f"[{now()}] [{level}] stage={stage} sample={sample_id} elapsed={elapsed} returncode={proc.returncode}\n")
     if proc.returncode != 0:
-        raise RuntimeError(f"Command failed [{stage}] sample={sample_id}; log={log_file}")
+        raise RuntimeError(command_failure_message(f"Command failed [{stage}] sample={sample_id}", log_file))
 
 
 def command_exists(tool: str) -> bool:
@@ -757,7 +785,7 @@ def run_reads_count(samples: List[Sample], cfg: Config, paths: Paths, logger: lo
             return
 
     logger.info("[bold cyan]Step 01 reads_count: clean FASTQ read totals[/bold cyan]")
-    jobs = calc_step_jobs(len(samples), cfg.total_thread_budget, cfg.seqkit_threads)
+    jobs = calc_step_jobs(len(samples), cfg.jobs, cfg.total_thread_budget, cfg.seqkit_threads)
     logger.info(f"reads_count parallelism: jobs={jobs}, seqkit_threads={cfg.seqkit_threads}, cpu_budget={cfg.total_thread_budget}")
 
     if cfg.force:
@@ -846,7 +874,7 @@ def extract_one_marker(sample: Sample, marker: str, cfg: Config, paths: Paths) -
 def run_extract(samples: List[Sample], cfg: Config, paths: Paths, logger: logging.Logger) -> None:
     logger.info("[bold cyan]Step 02 extract: marker candidate reads with BBDuk[/bold cyan]")
     tasks = [(s, marker) for s in samples for marker in cfg.markers]
-    jobs = calc_step_jobs(len(tasks), cfg.total_thread_budget, cfg.bbduk_threads)
+    jobs = calc_step_jobs(len(tasks), cfg.jobs, cfg.total_thread_budget, cfg.bbduk_threads)
     logger.info(
         f"extract parallelism: tasks={len(tasks)}, jobs={jobs}, "
         f"bbduk_threads={cfg.bbduk_threads}, cpu_budget={cfg.total_thread_budget}"
@@ -985,7 +1013,7 @@ def run_paired_minimap2(
             log.write(f"[{now()}] [{level}] stage={stage} sample={sample_id} marker={marker} elapsed={elapsed} returncode={returncode}\n")
 
         if returncode != 0:
-            raise RuntimeError(f"minimap2 failed: sample={sample_id} marker={marker}; log={log_file}")
+            raise RuntimeError(command_failure_message(f"minimap2 failed: sample={sample_id} marker={marker}", log_file))
 
         real_errors = [e for e in writer_errors if not isinstance(e, BrokenPipeError)]
         if real_errors:
@@ -1033,7 +1061,7 @@ def align_one_marker(sample: Sample, marker: str, cfg: Config, paths: Paths) -> 
 def run_align(samples: List[Sample], cfg: Config, paths: Paths, logger: logging.Logger) -> None:
     logger.info("[bold cyan]Step 03 align: paired marker reads with minimap2[/bold cyan]")
     tasks = [(s, marker) for s in samples for marker in cfg.markers]
-    jobs = calc_step_jobs(len(tasks), cfg.total_thread_budget, cfg.minimap2_threads)
+    jobs = calc_step_jobs(len(tasks), cfg.jobs, cfg.total_thread_budget, cfg.minimap2_threads)
     logger.info(
         f"align parallelism: tasks={len(tasks)}, jobs={jobs}, "
         f"minimap2_threads={cfg.minimap2_threads}, cpu_budget={cfg.total_thread_budget}, mode=paired"
@@ -1506,7 +1534,7 @@ def run_abundance(samples: List[Sample], cfg: Config, paths: Paths, extra_cols: 
 
     os.environ["POLARS_MAX_THREADS"] = str(cfg.polars_threads)
     clean_counts = read_clean_counts(paths.clean_out)
-    jobs = max(1, min(len(samples), cfg.abundance_jobs))
+    jobs = max(1, min(len(samples), cfg.jobs, cfg.abundance_jobs))
     payloads = samples_to_payload(samples, clean_counts, cfg, paths, extra_cols, ranks)
 
     logger.info(f"abundance parallelism: jobs={jobs}, polars_threads_per_job={cfg.polars_threads}, cpu_budget≈{jobs * cfg.polars_threads}")
@@ -1640,7 +1668,7 @@ def build_parser() -> argparse.ArgumentParser:
     flow.add_argument("--rank", default=DEFAULT_RANK, choices=RANKS + ["all"], help="Taxonomic rank. Default: genus.")
 
     par = p.add_argument_group("Optional arguments - parallelism and resources")
-    par.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="INT", help=f"Number of samples processed in parallel. Default: {DEFAULT_JOBS}.")
+    par.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="INT", help=f"Maximum concurrent workflow tasks. Default: {DEFAULT_JOBS}.")
     par.add_argument("-p", "--threads-per-sample", type=int, default=DEFAULT_THREADS_PER_SAMPLE, metavar="INT", help=f"Per-sample CPU budget. Default: {DEFAULT_THREADS_PER_SAMPLE}.")
     par.add_argument("--seqkit-threads", default=DEFAULT_SEQKIT_THREADS, metavar="INT|auto", help="seqkit threads per sample. Default: auto.")
     par.add_argument("--seqkit-max-threads", type=int, default=DEFAULT_SEQKIT_MAX_THREADS, metavar="INT", help=f"seqkit thread cap. Default: {DEFAULT_SEQKIT_MAX_THREADS}.")
