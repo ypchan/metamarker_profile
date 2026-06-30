@@ -739,6 +739,41 @@ def parse_seqkit_num_seqs(row: Dict[str, str]) -> int:
     return int(raw.replace(",", ""))
 
 
+def preview_text(path: Path, max_chars: int = 2000) -> str:
+    if not path.exists():
+        return "<missing>"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n<truncated>"
+    return text
+
+
+def count_reads_with_seqkit(sample: Sample, cfg: Config, paths: Paths, tmp: Path, log_file: Path) -> Tuple[int, int]:
+    cmd = ["seqkit", "stats", "-j", str(cfg.seqkit_threads), "-T", sample.r1_path, sample.r2_path]
+    run_cmd(cmd, str(log_file), "reads_count", sample.sample_id, paths, stdout_file=str(tmp))
+    with open(tmp, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        rows = list(reader)
+    if len(rows) < 2:
+        raise ValueError(
+            "seqkit stats did not return both mates "
+            f"for {sample.sample_id}: rows={len(rows)} tmp={tmp}\n"
+            f"R1={sample.r1_path}\n"
+            f"R2={sample.r2_path}\n"
+            f"--- seqkit stdout preview ---\n{preview_text(tmp)}"
+        )
+    return parse_seqkit_num_seqs(rows[0]), parse_seqkit_num_seqs(rows[1])
+
+
+def count_reads_with_python(sample: Sample, log_file: Path, reason: str = "") -> Tuple[int, int]:
+    with open(log_file, "a", encoding="utf-8") as log:
+        if reason:
+            log.write(f"[{now()}] [WARN] Falling back to native Python FASTQ count: {reason}\n")
+        log.write(f"[{now()}] [INFO] Native Python FASTQ count R1: {sample.r1_path}\n")
+        log.write(f"[{now()}] [INFO] Native Python FASTQ count R2: {sample.r2_path}\n")
+    return count_fastq_records_python(sample.r1_path), count_fastq_records_python(sample.r2_path)
+
+
 def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]:
     out = Path(paths.clean_tmp_dir) / f"{sample.row_no}.{sample.sample_id}.reads_stat.tsv"
     done = Path(paths.status_dir) / "reads_count" / f"{sample.sample_id}.done"
@@ -749,28 +784,25 @@ def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]
 
     ensure_dir(out.parent)
     ensure_dir(done.parent)
-    method = cfg.read_count_method
+    requested_method = cfg.read_count_method
+    method = requested_method
     if method == "auto":
         method = "seqkit" if command_exists("seqkit") else "python"
 
+    fallback_reason = ""
     if method == "seqkit":
         tmp = Path(paths.clean_tmp_dir) / f"{sample.row_no}.{sample.sample_id}.seqkit.stats.tmp"
-        cmd = ["seqkit", "stats", "-j", str(cfg.seqkit_threads), "-T", sample.r1_path, sample.r2_path]
-        run_cmd(cmd, str(log_file), "reads_count", sample.sample_id, paths, stdout_file=str(tmp))
-        with open(tmp, "r", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            rows = list(reader)
-            if len(rows) < 2:
-                raise ValueError(f"seqkit stats did not return both mates for {sample.sample_id}: {tmp}")
-            r1_reads = parse_seqkit_num_seqs(rows[0])
-            r2_reads = parse_seqkit_num_seqs(rows[1])
-        tmp.unlink(missing_ok=True)
+        try:
+            r1_reads, r2_reads = count_reads_with_seqkit(sample, cfg, paths, tmp, log_file)
+            tmp.unlink(missing_ok=True)
+        except Exception as exc:
+            if requested_method == "auto":
+                fallback_reason = str(exc).splitlines()[0]
+                r1_reads, r2_reads = count_reads_with_python(sample, log_file, reason=fallback_reason)
+            else:
+                raise
     else:
-        with open(log_file, "w", encoding="utf-8") as log:
-            log.write(f"[{now()}] [INFO] Native Python FASTQ count R1: {sample.r1_path}\n")
-            log.write(f"[{now()}] [INFO] Native Python FASTQ count R2: {sample.r2_path}\n")
-        r1_reads = count_fastq_records_python(sample.r1_path)
-        r2_reads = count_fastq_records_python(sample.r2_path)
+        r1_reads, r2_reads = count_reads_with_python(sample, log_file)
 
     read_pairs = min(r1_reads, r2_reads)
     clean_total = r1_reads + r2_reads
@@ -799,7 +831,7 @@ def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]
         encoding="utf-8",
     )
 
-    if not cfg.keep_task_logs:
+    if not cfg.keep_task_logs and not fallback_reason:
         Path(log_file).unlink(missing_ok=True)
 
     return {
@@ -807,6 +839,7 @@ def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]
         "r1_reads": r1_reads,
         "r2_reads": r2_reads,
         "read_count_delta": read_count_delta,
+        "read_count_fallback_reason": fallback_reason,
         "read_pairs": read_pairs,
         "clean_reads_total": clean_total,
     }
@@ -849,6 +882,12 @@ def run_reads_count(samples: List[Sample], cfg: Config, paths: Paths, logger: lo
                 except Exception:
                     logger.exception(f"reads_count failed: sample={sample_id}")
                     raise
+                if result.get("read_count_fallback_reason"):
+                    logger.warning(
+                        f"[yellow]seqkit reads_count incomplete for {sample_id}; "
+                        "fell back to native Python FASTQ counting. "
+                        f"Reason: {result['read_count_fallback_reason']}[/yellow]"
+                    )
                 if result.get("read_count_delta", 0):
                     logger.warning(
                         f"[yellow]R1/R2 read counts differ for {sample_id}: "

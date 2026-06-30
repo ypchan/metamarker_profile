@@ -181,7 +181,7 @@ python3 -m compileall metamarker_profile
 | `bbduk.sh` | Step 02 | marker candidate-read extraction |
 | `minimap2` | Step 03 | alignment to marker reference indexes |
 
-`seqkit` is optional. With `--read-count-method auto`, the pipeline uses `seqkit` when available and falls back to native Python FASTQ counting otherwise.
+`seqkit` is optional. With `--read-count-method auto`, the pipeline uses `seqkit` when available and falls back to native Python FASTQ counting if `seqkit` is unavailable or does not return complete counts for both mates.
 
 ### Optional tools
 
@@ -414,12 +414,13 @@ metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps
 
 ### Step 01 — counting reads
 
-Counts reads from clean FASTQ files with `seqkit` and writes `reads_stat.tsv`. R1/R2 may contain different numbers of reads; the workflow records both counts and continues.
+Counts reads from clean FASTQ files and writes `reads_stat.tsv`. In `--read-count-method auto` mode the workflow tries `seqkit stats` first, then falls back to native Python FASTQ counting if `seqkit` does not return complete counts for both mates. R1/R2 may contain different numbers of reads; the workflow records both counts and continues.
 
 | Option | Default | Meaning |
 |---|---:|---|
 | `--seqkit-threads` | `auto` | threads used by `seqkit stats` per sample |
 | `--seqkit-max-threads` | `4` | cap for seqkit threads because gzip/I/O usually bottlenecks first |
+| `--read-count-method` | `auto` | `auto`, `seqkit`, or `python`; explicit `seqkit` stays strict |
 | `--jobs` | `4` | maximum concurrent workflow tasks |
 
 Output:
@@ -859,6 +860,21 @@ Recommended reporting:
 ```
 
 By default, seqkit is capped at 4 threads and extra CPU budget is used for more sample-level parallelism. Avoid forcing too many threads onto a single compressed FASTQ file.
+
+### `seqkit stats did not return both mates`
+
+This means the reads-count step received fewer than two data rows from `seqkit stats -T R1 R2`. It is not the normal "R1/R2 read counts differ" case; different read counts are allowed. Check the sample stdout table and task log:
+
+```bash
+cat metamarker_profile_out/.tmp/01_reads_count/10.ERR7528964.seqkit.stats.tmp
+cat metamarker_profile_out/.tmp/task_logs/reads_count.ERR7528964.log
+```
+
+Common causes are a skipped/unreadable mate file, truncated gzip/FASTQ content, or a `seqkit` version/runtime issue. In `--read-count-method auto`, current versions fall back to native Python FASTQ counting and keep the per-sample log for inspection. To bypass `seqkit` explicitly, rerun:
+
+```bash
+metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps reads_count --read-count-method python --force
+```
 
 ### BBDuk reports Java heap errors
 
