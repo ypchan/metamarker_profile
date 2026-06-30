@@ -9,7 +9,7 @@ Workflow
 --------
 1. Count clean paired-end reads.
 2. Extract marker candidate reads with BBDuk.
-3. Align marker candidate R1/R2 reads together with one minimap2 call and write paired PAF.
+3. Align marker candidate R1/R2 reads together with one minimap2 call and write mate-labeled PAF.
 4. Parse PAF with Python + Polars and calculate marker RPM/RPKM.
 
 Design notes
@@ -17,8 +17,8 @@ Design notes
 - External align/extract tools are still BBDuk and minimap2.
 - Polars is the abundance engine.
 - Abundance is parallelized at sample level, while extract/align are scheduled at sample-marker level.
-- R1/R2 are streamed into one paired minimap2 process per sample-marker task.
-  Query names are normalized to /1 and /2 mate suffixes so minimap2 keeps PE pairing.
+- R1/R2 are extracted independently and streamed into one minimap2 process per sample-marker task.
+  Query names are normalized to /1 and /2 mate suffixes so the parser can recover mate pairs by read ID.
 - R1/R2 taxonomic conflicts are arbitrated at pair level:
   the better mate hit wins and both mates are assigned to that winner.
 
@@ -426,7 +426,7 @@ def run_cmd(
     write_command(paths, stage, sample_id, cmd)
     ensure_dir(Path(log_file).parent)
     t0 = time.time()
-    with open(log_file, "a", encoding="utf-8") as log:
+    with open(log_file, "w", encoding="utf-8") as log:
         log.write(f"[{now()}] [START] stage={stage} sample={sample_id}\n")
         log.write(f"[{now()}] [CMD] {shlex_join(cmd)}\n")
         if stdout_file:
@@ -703,7 +703,7 @@ def print_run_plan(console: Console, cfg: Config, paths: Paths, samples: List[Sa
     table.add_row("seqkit threads", str(cfg.seqkit_threads))
     table.add_row("BBDuk threads", str(cfg.bbduk_threads))
     table.add_row("minimap2 threads", str(cfg.minimap2_threads))
-    table.add_row("minimap2 mode", "paired R1/R2 single process")
+    table.add_row("minimap2 mode", "R1/R2 mate-labeled single process")
     table.add_row("abundance jobs", str(cfg.abundance_jobs))
     table.add_row("Polars threads/task", str(cfg.polars_threads))
     table.add_row("Outdir", paths.outdir)
@@ -724,6 +724,11 @@ def count_fastq_records_python(path: str) -> int:
     return n // 4
 
 
+def parse_seqkit_num_seqs(row: Dict[str, str]) -> int:
+    raw = row.get("num_seqs") or row.get("num_seqs ") or "0"
+    return int(raw.replace(",", ""))
+
+
 def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]:
     out = Path(paths.clean_tmp_dir) / f"{sample.row_no}.{sample.sample_id}.reads_stat.tsv"
     done = Path(paths.status_dir) / "reads_count" / f"{sample.sample_id}.done"
@@ -740,19 +745,26 @@ def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]
 
     if method == "seqkit":
         tmp = Path(paths.clean_tmp_dir) / f"{sample.row_no}.{sample.sample_id}.seqkit.stats.tmp"
-        cmd = ["seqkit", "stats", "-j", str(cfg.seqkit_threads), "-T", sample.r1_path]
+        cmd = ["seqkit", "stats", "-j", str(cfg.seqkit_threads), "-T", sample.r1_path, sample.r2_path]
         run_cmd(cmd, str(log_file), "reads_count", sample.sample_id, paths, stdout_file=str(tmp))
         with open(tmp, "r", encoding="utf-8") as fh:
             reader = csv.DictReader(fh, delimiter="\t")
-            row = next(reader)
-            read_pairs = int(row.get("num_seqs", row.get("num_seqs ", "0")).replace(",", ""))
+            rows = list(reader)
+            if len(rows) < 2:
+                raise ValueError(f"seqkit stats did not return both mates for {sample.sample_id}: {tmp}")
+            r1_reads = parse_seqkit_num_seqs(rows[0])
+            r2_reads = parse_seqkit_num_seqs(rows[1])
         tmp.unlink(missing_ok=True)
     else:
         with open(log_file, "w", encoding="utf-8") as log:
-            log.write(f"[{now()}] [INFO] Native Python FASTQ count: {sample.r1_path}\n")
-        read_pairs = count_fastq_records_python(sample.r1_path)
+            log.write(f"[{now()}] [INFO] Native Python FASTQ count R1: {sample.r1_path}\n")
+            log.write(f"[{now()}] [INFO] Native Python FASTQ count R2: {sample.r2_path}\n")
+        r1_reads = count_fastq_records_python(sample.r1_path)
+        r2_reads = count_fastq_records_python(sample.r2_path)
 
-    clean_total = read_pairs * 2
+    read_pairs = min(r1_reads, r2_reads)
+    clean_total = r1_reads + r2_reads
+    read_count_delta = abs(r1_reads - r2_reads)
 
     with open(out.with_suffix(out.suffix + ".tmp"), "w", encoding="utf-8") as tmp_out:
         tmp_out.write(
@@ -763,17 +775,31 @@ def count_reads_one(sample: Sample, cfg: Config, paths: Paths) -> Dict[str, Any]
                 sample.depth,
                 sample.r1_path,
                 sample.r2_path,
+                str(r1_reads),
+                str(r2_reads),
+                str(read_count_delta),
                 str(read_pairs),
                 str(clean_total),
             ]) + "\n"
         )
     out.with_suffix(out.suffix + ".tmp").replace(out)
-    done.write_text(f"sample_id={sample.sample_id}\tread_pairs={read_pairs}\tclean_reads_total={clean_total}\n", encoding="utf-8")
+    done.write_text(
+        f"sample_id={sample.sample_id}\tr1_reads={r1_reads}\tr2_reads={r2_reads}\t"
+        f"read_count_delta={read_count_delta}\tread_pairs={read_pairs}\tclean_reads_total={clean_total}\n",
+        encoding="utf-8",
+    )
 
     if not cfg.keep_task_logs:
         Path(log_file).unlink(missing_ok=True)
 
-    return {"sample_id": sample.sample_id, "read_pairs": read_pairs, "clean_reads_total": clean_total}
+    return {
+        "sample_id": sample.sample_id,
+        "r1_reads": r1_reads,
+        "r2_reads": r2_reads,
+        "read_count_delta": read_count_delta,
+        "read_pairs": read_pairs,
+        "clean_reads_total": clean_total,
+    }
 
 
 def run_reads_count(samples: List[Sample], cfg: Config, paths: Paths, logger: logging.Logger) -> None:
@@ -809,14 +835,23 @@ def run_reads_count(samples: List[Sample], cfg: Config, paths: Paths, logger: lo
             for fut in as_completed(futs):
                 sample_id = futs[fut]
                 try:
-                    fut.result()
+                    result = fut.result()
                 except Exception:
                     logger.exception(f"reads_count failed: sample={sample_id}")
                     raise
+                if result.get("read_count_delta", 0):
+                    logger.warning(
+                        f"[yellow]R1/R2 read counts differ for {sample_id}: "
+                        f"R1={result['r1_reads']} R2={result['r2_reads']} delta={result['read_count_delta']}; "
+                        "continuing with independent mate extraction.[/yellow]"
+                    )
                 progress.update(task, advance=1)
 
     with open(paths.clean_out + ".tmp", "w", encoding="utf-8") as out:
-        out.write("sample_id\tyear\tmonth\tdepth\tr1_path\tr2_path\tread_pairs\tclean_reads_total\n")
+        out.write(
+            "sample_id\tyear\tmonth\tdepth\tr1_path\tr2_path\t"
+            "r1_reads\tr2_reads\tread_count_delta\tread_pairs\tclean_reads_total\n"
+        )
         for s in samples:
             f = Path(paths.clean_tmp_dir) / f"{s.row_no}.{s.sample_id}.reads_stat.tsv"
             if not f.exists():
@@ -826,49 +861,82 @@ def run_reads_count(samples: List[Sample], cfg: Config, paths: Paths, logger: lo
     logger.info(f"[green]Written reads stats:[/green] {paths.clean_out}")
 
 
-def extract_one_marker(sample: Sample, marker: str, cfg: Config, paths: Paths) -> None:
-    out_r1 = Path(paths.marker_dir) / marker / f"{sample.sample_id}.{marker}.R1.fq.gz"
-    out_r2 = Path(paths.marker_dir) / marker / f"{sample.sample_id}.{marker}.R2.fq.gz"
-    stat = Path(paths.marker_dir) / "stats" / f"{sample.sample_id}.{marker}.bbduk.stats.txt"
-    done = Path(paths.status_dir) / "extract" / f"{sample.sample_id}.{marker}.done"
-    log_file = Path(paths.task_log_dir) / f"extract.{sample.sample_id}.{marker}.bbduk.log"
-    tag = f"{sample.sample_id}.{marker}.{os.getpid()}"
-    tmp_r1 = Path(paths.marker_dir) / "tmp" / f"{tag}.R1.fq.gz.tmp"
-    tmp_r2 = Path(paths.marker_dir) / "tmp" / f"{tag}.R2.fq.gz.tmp"
-    tmp_stat = Path(paths.marker_dir) / "tmp" / f"{tag}.stats.tmp"
-
-    if cfg.resume and not cfg.force and out_r1.exists() and out_r2.exists() and stat.exists() and done.exists():
-        return
-
-    for p in [tmp_r1, tmp_r2, tmp_stat]:
-        p.unlink(missing_ok=True)
-
+def build_bbduk_single_cmd(cfg: Config, marker: str, in_path: str, out_path: Path, stat_path: Path) -> List[str]:
     cmd = [
         "bbduk.sh",
         f"-Xmx{cfg.bbmap_mem}",
-        f"in1={sample.r1_path}",
-        f"in2={sample.r2_path}",
-        f"outm1={tmp_r1}",
-        f"outm2={tmp_r2}",
+        f"in={in_path}",
+        f"outm={out_path}",
         f"ref={marker_ref(cfg, marker)}",
         f"k={cfg.k[marker]}",
         f"hdist={cfg.hdist[marker]}",
         f"mkh={cfg.mkh[marker]}",
         f"t={cfg.bbduk_threads}",
         "ordered=t",
-        f"stats={tmp_stat}",
+        f"stats={stat_path}",
     ]
     if cfg.mink[marker] > 0:
         cmd.append(f"mink={cfg.mink[marker]}")
+    return cmd
 
-    run_cmd(cmd, str(log_file), "extract", sample.sample_id, paths)
-    tmp_r1.replace(out_r1)
-    tmp_r2.replace(out_r2)
-    tmp_stat.replace(stat)
-    done.write_text(f"sample_id={sample.sample_id}\tmarker={marker}\tout_r1={out_r1}\tout_r2={out_r2}\n", encoding="utf-8")
+
+def merge_bbduk_stats(tmp_stat_r1: Path, tmp_stat_r2: Path, tmp_stat: Path) -> None:
+    with open(tmp_stat, "w", encoding="utf-8") as out:
+        for mate, src in [("R1", tmp_stat_r1), ("R2", tmp_stat_r2)]:
+            out.write(f"# {mate}\n")
+            if src.exists():
+                text = src.read_text(encoding="utf-8", errors="replace")
+                out.write(text)
+                if text and not text.endswith("\n"):
+                    out.write("\n")
+            else:
+                out.write("# stats file missing\n")
+
+
+def extract_one_marker(sample: Sample, marker: str, cfg: Config, paths: Paths) -> None:
+    out_r1 = Path(paths.marker_dir) / marker / f"{sample.sample_id}.{marker}.R1.fq.gz"
+    out_r2 = Path(paths.marker_dir) / marker / f"{sample.sample_id}.{marker}.R2.fq.gz"
+    stat = Path(paths.marker_dir) / "stats" / f"{sample.sample_id}.{marker}.bbduk.stats.txt"
+    done = Path(paths.status_dir) / "extract" / f"{sample.sample_id}.{marker}.done"
+    log_r1 = Path(paths.task_log_dir) / f"extract.{sample.sample_id}.{marker}.R1.bbduk.log"
+    log_r2 = Path(paths.task_log_dir) / f"extract.{sample.sample_id}.{marker}.R2.bbduk.log"
+    tag = f"{sample.sample_id}.{marker}.{os.getpid()}"
+    tmp_r1 = Path(paths.marker_dir) / "tmp" / f"{tag}.R1.tmp.fq.gz"
+    tmp_r2 = Path(paths.marker_dir) / "tmp" / f"{tag}.R2.tmp.fq.gz"
+    tmp_stat_r1 = Path(paths.marker_dir) / "tmp" / f"{tag}.R1.stats.tmp"
+    tmp_stat_r2 = Path(paths.marker_dir) / "tmp" / f"{tag}.R2.stats.tmp"
+    tmp_stat = Path(paths.marker_dir) / "tmp" / f"{tag}.stats.tmp"
+
+    if cfg.resume and not cfg.force and out_r1.exists() and out_r2.exists() and stat.exists() and done.exists():
+        return
+
+    for p in [tmp_r1, tmp_r2, tmp_stat_r1, tmp_stat_r2, tmp_stat]:
+        p.unlink(missing_ok=True)
+
+    cmd_r1 = build_bbduk_single_cmd(cfg, marker, sample.r1_path, tmp_r1, tmp_stat_r1)
+    cmd_r2 = build_bbduk_single_cmd(cfg, marker, sample.r2_path, tmp_r2, tmp_stat_r2)
+    try:
+        run_cmd(cmd_r1, str(log_r1), "extract", sample.sample_id, paths)
+        run_cmd(cmd_r2, str(log_r2), "extract", sample.sample_id, paths)
+        merge_bbduk_stats(tmp_stat_r1, tmp_stat_r2, tmp_stat)
+        tmp_r1.replace(out_r1)
+        tmp_r2.replace(out_r2)
+        tmp_stat.replace(stat)
+        done.write_text(
+            f"sample_id={sample.sample_id}\tmarker={marker}\tmode=independent_mates\t"
+            f"out_r1={out_r1}\tout_r2={out_r2}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        for p in [tmp_r1, tmp_r2, tmp_stat_r1, tmp_stat_r2, tmp_stat]:
+            p.unlink(missing_ok=True)
+        raise
 
     if not cfg.keep_task_logs:
-        log_file.unlink(missing_ok=True)
+        log_r1.unlink(missing_ok=True)
+        log_r2.unlink(missing_ok=True)
+    for p in [tmp_stat_r1, tmp_stat_r2]:
+        p.unlink(missing_ok=True)
 
 
 def run_extract(samples: List[Sample], cfg: Config, paths: Paths, logger: logging.Logger) -> None:
@@ -1059,7 +1127,7 @@ def align_one_marker(sample: Sample, marker: str, cfg: Config, paths: Paths) -> 
 
 
 def run_align(samples: List[Sample], cfg: Config, paths: Paths, logger: logging.Logger) -> None:
-    logger.info("[bold cyan]Step 03 align: paired marker reads with minimap2[/bold cyan]")
+    logger.info("[bold cyan]Step 03 align: mate-labeled marker reads with minimap2[/bold cyan]")
     tasks = [(s, marker) for s in samples for marker in cfg.markers]
     jobs = calc_step_jobs(len(tasks), cfg.jobs, cfg.total_thread_budget, cfg.minimap2_threads)
     logger.info(
@@ -1638,7 +1706,7 @@ def build_parser() -> argparse.ArgumentParser:
         Workflow components:
           seqkit/Python read counting
           BBDuk candidate-read extraction
-          paired R1/R2 minimap2 PAF alignment
+          mate-labeled R1/R2 minimap2 PAF alignment
           Polars abundance parser
         """),
         epilog=epilog,

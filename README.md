@@ -64,6 +64,7 @@ metamarker_profile/
 ├── scripts/
 │   ├── build_ref_files.py            # optional reference preparation helper
 │   ├── analysis_common.R             # shared R plotting/stat helpers
+│   ├── extract_lineage_reads_assemble.py
 │   ├── diversity_alpha_beta.R
 │   ├── differential_abundance_compositional.R
 │   ├── biomarker_discovery_nonparametric.R
@@ -410,7 +411,7 @@ metamarker_profile --input data_path.tsv --outdir metamarker_profile_out --steps
 
 ### Step 01 — counting reads
 
-Counts reads from clean FASTQ files with `seqkit` and writes `reads_stat.tsv`.
+Counts reads from clean FASTQ files with `seqkit` and writes `reads_stat.tsv`. R1/R2 may contain different numbers of reads; the workflow records both counts and continues.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -427,18 +428,21 @@ reads_stat.tsv
 Core columns:
 
 ```text
-sample_id  year  month  depth  r1_path  r2_path  read_pairs  clean_reads_total
+sample_id  year  month  depth  r1_path  r2_path  r1_reads  r2_reads  read_count_delta  read_pairs  clean_reads_total
 ```
 
 Normalization denominator:
 
 ```text
-clean_reads_total = R1 read count × 2
+clean_reads_total = R1 read count + R2 read count
 ```
+
+If R1/R2 read counts differ, `read_count_delta` records the difference. Downstream pairing is based on read IDs, not record order.
+`read_pairs` is retained as a compatibility estimate (`min(r1_reads, r2_reads)`); abundance normalization uses `clean_reads_total`.
 
 ### Step 02 — extract marker candidate reads
 
-Uses `BBDuk` to extract paired reads matching marker references.
+Uses `BBDuk` to extract marker-matching R1 and R2 reads independently. This allows input files with different read counts; downstream alignment restores mate relationships by read ID.
 
 | Option | 16S default | 18S default | ITS default | Meaning |
 |---|---:|---:|---:|---|
@@ -463,7 +467,7 @@ Output:
 
 ### Step 03 — align marker reads
 
-Uses one `minimap2` process per sample-marker task to align extracted R1/R2 reads together and writes a paired PAF file. Query IDs are normalized internally to `/1` and `/2` mate suffixes so minimap2 can recognize PE pairing and the Polars parser can arbitrate mates from one PAF.
+Uses one `minimap2` process per sample-marker task to align extracted R1/R2 reads together and writes a mate-labeled PAF file. Query IDs are normalized internally to `/1` and `/2` mate suffixes so the Polars parser can pair mates by read ID and arbitrate mates from one PAF.
 
 PAF is used because this workflow quantifies marker-read support and taxonomic assignment, not insert-size or genome-coordinate paired-end evidence.
 
@@ -505,7 +509,7 @@ Best-hit assignment order:
 7. mate (`R1` before `R2` only as a deterministic final biological tie-break)
 8. target ID
 
-PE handling is read-level counting with pair-level arbitration:
+Mate handling is read-level counting with pair-level arbitration by normalized read ID:
 
 - if both mates support the same lineage, both reads are counted for that lineage;
 - if only one mate has a valid hit, that one read is counted;
@@ -529,6 +533,51 @@ all.marker_rpm.assignment_qc.tsv
 ```
 
 `assignment_stats` preserves raw assignment counts per requested rank. `assignment_qc` is a rank-independent diagnostic table with rates derived from the same counts; it is not used to filter results.
+
+---
+
+## Extract Reads For Lineage Validation
+
+Use `scripts/extract_lineage_reads_assemble.py` to pull out all marker reads assigned to one lineage and prepare sequence-level validation inputs.
+
+Example:
+
+```bash
+python3 scripts/extract_lineage_reads_assemble.py \
+  --outdir metamarker_profile_out \
+  --rank genus \
+  --lineage "Targetus" \
+  --markers 16S \
+  --assembler olc
+```
+
+The script reuses the same PAF filters and R1/R2 arbitration rules as the abundance step. In default `--mode assigned`, reads are selected from pairs assigned to the requested lineage after pair arbitration. This matches the abundance table: single-end reads are retained, and discordant R1/R2 pairs follow the better mate. For a stricter annotation check, use `--mode mate-hit` to keep only mates whose own best hit matches the lineage.
+
+Main outputs:
+
+```text
+lineage_extract/<rank>_<lineage>/
+├── reads.R1.fq.gz
+├── reads.R2.fq.gz
+├── merged_segments.fq.gz
+├── merged_segments.fa
+├── olc_contigs.fa
+├── olc_contigs.fq.gz
+├── olc_summary.tsv
+├── selected_reads.tsv
+└── summary.tsv
+```
+
+`merged_segments.fq.gz` is the required OLC input. It contains the selected R1/R2 read pool, oriented by the best PAF strand before assembly. The built-in `--assembler olc` path is pure Python and does not call external programs. It greedily merges suffix-prefix overlaps and writes assembled marker contigs to `olc_contigs.fa`.
+
+You can also run OLC directly on an existing merged segments file:
+
+```bash
+python3 scripts/extract_lineage_reads_assemble.py \
+  --segments-fastq metamarker_profile_out/lineage_extract/genus_Targetus/merged_segments.fq.gz \
+  --olc-min-overlap 40 \
+  --olc-min-identity 0.98
+```
 
 ---
 
@@ -637,7 +686,7 @@ metamarker_profile_out/
 | `sample_manifest.tsv` | parsed and standardized sample manifest |
 | `run_config.tsv` | run-time parameters and resolved reference paths |
 | `commands/` | executed command lines grouped by stage and sample |
-| `reads_stat.tsv` | read-pair counts and clean-read totals |
+| `reads_stat.tsv` | R1/R2 read counts, count deltas, legacy read-pair estimate, and clean-read totals |
 | `all.marker_rpm.<rank>.long.tsv` | tidy long abundance table |
 | `all.marker_rpm.<rank>.assignment_stats.tsv` | alignment filtering, paired-end discordance, reassigned discordant reads, tie-breaking, and assignment statistics |
 | `all.marker_rpm.assignment_qc.tsv` | rank-independent diagnostic rates for alignment pass rate, assignment rate, and paired-end discordance |
@@ -799,6 +848,16 @@ Increase BBDuk memory:
 ```
 
 On shared clusters, request matching memory from the scheduler.
+
+### BBDuk reports different numbers of reads in paired input files
+
+Older versions used BBDuk paired input mode and failed when R1/R2 read counts differed. Current versions extract R1 and R2 independently, so this error usually means the installed package is older than the source tree. Check both files with:
+
+```bash
+seqkit stats -T fq/ERR10446187_1.fastq.gz fq/ERR10446187_2.fastq.gz
+```
+
+If the read counts differ, rerun with the current `metamarker_profile` version and use `--force` or a fresh output directory so the extract step is regenerated. Pair-level arbitration later uses read IDs, so equal file lengths are not required.
 
 ### The run appears stuck during extract or align
 
