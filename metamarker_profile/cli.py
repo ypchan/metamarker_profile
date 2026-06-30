@@ -90,7 +90,7 @@ UNITE_REF_PREFIX = "UNITE_public_19.02.2025"
 DEFAULT_OUTDIR = "metamarker_profile_out"
 DEFAULT_STEPS = "all"
 DEFAULT_MARKERS = "16S,ITS"
-DEFAULT_RANK = "genus"
+DEFAULT_RANK = "species"
 
 DEFAULT_JOBS = 4
 DEFAULT_THREADS_PER_SAMPLE = 4
@@ -119,6 +119,16 @@ DEFAULT_MIN_MAPQ = 0
 
 RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
 MARKER_ORDER = ["16S", "18S", "ITS"]
+NA_GROUP = "NA"
+RANK_PREFIX = {
+    "domain": "d__",
+    "phylum": "p__",
+    "class": "c__",
+    "order": "o__",
+    "family": "f__",
+    "genus": "g__",
+    "species": "s__",
+}
 
 # Rich argparse style
 RawDescriptionRichHelpFormatter.styles["argparse.prog"] = "bold magenta"
@@ -1173,7 +1183,7 @@ def _abundance_worker_init(taxonomy_path: str, ranks_to_output: List[str], polar
     global _TAX, _RANKS_TO_OUTPUT
     _RANKS_TO_OUTPUT = ranks_to_output
 
-    cols = ["ref_id", "marker"] + RANKS
+    required_cols = ["ref_id", "marker", "euk_group"] + RANKS
     tax = pl.read_csv(
         taxonomy_path,
         separator="\t",
@@ -1181,10 +1191,13 @@ def _abundance_worker_init(taxonomy_path: str, ranks_to_output: List[str], polar
         infer_schema_length=1000,
         ignore_errors=True,
     )
-    missing = [c for c in cols if c not in tax.columns]
+    missing = [c for c in required_cols if c not in tax.columns]
     if missing:
         raise ValueError(f"Taxonomy table missing columns: {','.join(missing)}")
-    tax = tax.select(cols).with_columns([pl.col(c).cast(pl.Utf8).str.strip_chars().alias(c) for c in cols])
+    tax = tax.select(required_cols).with_columns([pl.col(c).cast(pl.Utf8).str.strip_chars().alias(c) for c in required_cols])
+    missing_euk_group_rows = tax.filter(pl.col("euk_group").is_null() | (pl.col("euk_group") == "")).height
+    if missing_euk_group_rows:
+        raise ValueError(f"Taxonomy table has empty euk_group values: rows={missing_euk_group_rows}. Rebuild refs with scripts/build_ref_files.py.")
     tax = tax.with_columns(
         [
             pl.when(pl.col("domain").is_null() | (pl.col("domain") == ""))
@@ -1354,6 +1367,25 @@ def assign_pairs(hits):
     return winner, stats
 
 
+def lineage_ranks(rank: str) -> List[str]:
+    return RANKS[: RANKS.index(rank) + 1]
+
+
+def full_lineage_expr(rank_to_output: str):
+    import polars as pl
+
+    parts = []
+    for rank in lineage_ranks(rank_to_output):
+        default_value = "NA" if rank == "domain" else "unidentified"
+        parts.append(
+            pl.concat_str([
+                pl.lit(RANK_PREFIX[rank]),
+                pl.col(rank).fill_null(default_value),
+            ])
+        )
+    return pl.concat_str(parts, separator=";").alias("lineage")
+
+
 def write_abundance_rows(
     assigned,
     sample: Dict[str, Any],
@@ -1384,10 +1416,12 @@ def write_abundance_rows(
         df = (
             assigned
             .with_columns([
-                pl.col(rank).fill_null("unidentified").alias("lineage"),
+                full_lineage_expr(rank),
+                pl.col("euk_group").fill_null(NA_GROUP).alias("euk_group"),
+                pl.col(rank).fill_null("NA" if rank == "domain" else "unidentified").alias("rank_lineage"),
                 (pl.col("target_len") * pl.col("read_weight")).alias("weighted_tlen"),
             ])
-            .group_by(["domain", "lineage"])
+            .group_by(["domain", "euk_group", "lineage", "rank_lineage"])
             .agg([
                 pl.col("read_weight").sum().alias("taxon_marker_reads"),
                 pl.col("weighted_tlen").sum().alias("target_len_sum"),
@@ -1397,8 +1431,8 @@ def write_abundance_rows(
                 rpm_expr,
                 rpkm_expr,
             ])
-            .select(["domain", "lineage", "taxon_marker_reads", "mean_target_length_bp", "marker_rpm", "marker_rpkm"])
-            .sort(["domain", "taxon_marker_reads", "lineage"], descending=[False, True, False])
+            .select(["domain", "euk_group", "lineage", "rank_lineage", "taxon_marker_reads", "mean_target_length_bp", "marker_rpm", "marker_rpkm"])
+            .sort(["domain", "euk_group", "taxon_marker_reads", "lineage"], descending=[False, False, True, False])
         )
 
         with open(out_files[rank], "a", encoding="utf-8") as out:
@@ -1407,8 +1441,10 @@ def write_abundance_rows(
                     sample["sample_id"],
                     marker,
                     row["domain"] or "NA",
+                    row["euk_group"] or NA_GROUP,
                     rank,
                     row["lineage"] or "unidentified",
+                    row["rank_lineage"] or "unidentified",
                     str(int(row["taxon_marker_reads"])),
                     str(clean_total),
                     fmt_float(row["marker_rpm"]),
@@ -1539,7 +1575,7 @@ def samples_to_payload(samples: List[Sample], clean_counts: Dict[str, int], cfg:
 
 def merge_abundance_outputs(samples: List[Sample], ranks: List[str], paths: Paths, extra_cols: List[str], logger: logging.Logger) -> None:
     long_header = [
-        "sample_id", "marker", "domain", "rank", "lineage",
+        "sample_id", "marker", "domain", "euk_group", "rank", "lineage", "rank_lineage",
         "taxon_marker_reads", "clean_reads_total", "marker_rpm", "marker_rpkm", "mean_target_length_bp",
     ] + extra_cols
     stats_header = [
@@ -1727,13 +1763,13 @@ def build_parser() -> argparse.ArgumentParser:
     ref.add_argument("--index-16s", metavar="FILE", help="Override minimap2 index for 16S.")
     ref.add_argument("--index-18s", metavar="FILE", help="Override minimap2 index for 18S.")
     ref.add_argument("--index-its", metavar="FILE", help="Override minimap2 index for ITS.")
-    ref.add_argument("--taxonomy", metavar="FILE", help="Override ref_id/marker/domain/ranks taxonomy TSV.")
+    ref.add_argument("--taxonomy", metavar="FILE", help="Override ref_id/marker/domain/euk_group/ranks taxonomy TSV.")
 
     flow = p.add_argument_group("Optional arguments - workflow control")
     flow.add_argument("-o", "--outdir", default=DEFAULT_OUTDIR, metavar="DIR", help=f"Output directory. Default: {DEFAULT_OUTDIR}.")
     flow.add_argument("--steps", default=DEFAULT_STEPS, metavar="LIST", help="all or comma list: reads_count,extract,align,abundance. Default: all.")
     flow.add_argument("--markers", default=DEFAULT_MARKERS, metavar="LIST", help="Marker list: 16S,18S,ITS. Default: 16S,ITS.")
-    flow.add_argument("--rank", default=DEFAULT_RANK, choices=RANKS + ["all"], help="Taxonomic rank. Default: genus.")
+    flow.add_argument("--rank", default=DEFAULT_RANK, choices=RANKS + ["all"], help=f"Taxonomic rank. Default: {DEFAULT_RANK}.")
 
     par = p.add_argument_group("Optional arguments - parallelism and resources")
     par.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, metavar="INT", help=f"Maximum concurrent workflow tasks. Default: {DEFAULT_JOBS}.")

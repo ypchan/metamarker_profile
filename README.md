@@ -305,9 +305,9 @@ minimap2 -d "$REF_DIR/UNITE_public_19.02.2025.shortid.fasta.mmi" \
 `ref_taxonomy.tsv` must contain:
 
 ```tsv
-ref_id	marker	domain	phylum	class	order	family	genus	species
-AB000393.1.1510	16S	Bacteria	Pseudomonadota	Gammaproteobacteria	Enterobacterales	Vibrionaceae	Vibrio	Vibrio_halioticoli
-UDB016649	ITS	Fungi	Ascomycota	Sordariomycetes	Hypocreales	Nectriaceae	Fusarium	Fusarium_sp
+ref_id	marker	domain	euk_group	phylum	class	order	family	genus	species
+AB000393.1.1510	16S	Bacteria	NA	Pseudomonadota	Gammaproteobacteria	Enterobacterales	Vibrionaceae	Vibrio	Vibrio_halioticoli
+UDB016649	ITS	Fungi	Fungi	Ascomycota	Sordariomycetes	Hypocreales	Nectriaceae	Fusarium	Fusarium_sp
 ```
 
 Reference parsing rules:
@@ -315,6 +315,8 @@ Reference parsing rules:
 - SILVA `Bacteria` and `Archaea` records are treated as `16S`.
 - SILVA `Eukaryota` records are treated as `18S`.
 - UNITE records are treated as `ITS`.
+- `euk_group` is metadata, not an eighth taxonomy rank. Use it to separate fungal eukaryotes from other eukaryotic groups. Recommended values include `Fungi`, `Metazoa`, `Viridiplantae`, `Alveolata`, `Stramenopiles`, `Rhizaria`, and `Amoebozoa`; use `NA` for non-eukaryotic records.
+- Taxonomy files without `euk_group` are rejected. Rebuild refs with `scripts/build_ref_files.py` so every record has an explicit `euk_group`.
 - SILVA records with exact lineage item `Mitochondria` or `Chloroplast` are removed by default.
 
 ---
@@ -497,7 +499,7 @@ Parses paired PAF files, filters alignments, assigns each read pair to the singl
 | `--min-aln-len-*` | `80` | `80` | `80` | minimum aligned length |
 | `--min-qcov-*` | `0.60` | `0.60` | `0.60` | minimum query coverage |
 | `--min-mapq` | colspan | colspan | `0` | minimum MAPQ |
-| `--rank` | colspan | colspan | `genus` | `domain,phylum,class,order,family,genus,species,all` |
+| `--rank` | colspan | colspan | `species` | `domain,phylum,class,order,family,genus,species,all` |
 
 Best-hit assignment order:
 
@@ -556,6 +558,8 @@ python3 scripts/extract_lineage_reads_assemble.py \
 
 The script reuses the same PAF filters and R1/R2 arbitration rules as the abundance step. In default `--mode assigned`, reads are selected from pairs assigned to the requested lineage after pair arbitration. This matches the abundance table: single-end reads are retained, and discordant R1/R2 pairs follow the better mate. For a stricter annotation check, use `--mode mate-hit` to keep only mates whose own best hit matches the lineage.
 
+`--lineage` accepts either the short value at `--rank` or the complete lineage path from `all.marker_rpm.<rank>.long.tsv`. `selected_reads.tsv` reports both short rank labels and complete lineage paths for mate-level and assigned classifications.
+
 Main outputs:
 
 ```text
@@ -603,7 +607,7 @@ python3 scripts/extract_lineage_reads_assemble.py \
 | `--outdir DIR` | `metamarker_profile_out` | output directory |
 | `--steps LIST` | `all` | `reads_count,extract,align,abundance` or `all` |
 | `--markers LIST` | `16S,ITS` | marker set: `16S`, `18S`, `ITS` |
-| `--rank RANK` | `genus` | output taxonomy rank or `all` |
+| `--rank RANK` | `species` | output taxonomy rank or `all` |
 
 ### Parallelism and HPC resources
 
@@ -706,8 +710,10 @@ metamarker_profile_out/
 sample_id
 marker
 domain
+euk_group
 rank
 lineage
+rank_lineage
 taxon_marker_reads
 clean_reads_total
 marker_rpm
@@ -716,7 +722,13 @@ mean_target_length_bp
 <additional sample metadata columns>
 ```
 
-Taxonomy values with empty rank fields are reported as `unidentified`; missing domains are reported as `NA`.
+`lineage` is the complete taxonomy path through the requested `rank`, formatted with rank prefixes.
+The default `--rank species` writes seven ranks:
+`d__<domain>;p__<phylum>;c__<class>;o__<order>;f__<family>;g__<genus>;s__<species>`.
+For `--rank genus`, `lineage` writes six ranks and omits species:
+`d__<domain>;p__<phylum>;c__<class>;o__<order>;f__<family>;g__<genus>`.
+`euk_group` is reported separately and is not embedded in `lineage`.
+`rank_lineage` is the short value at the requested `rank`. Taxonomy values with empty rank fields are reported as `unidentified`; missing domains are reported as `NA`.
 
 ---
 
@@ -789,8 +801,8 @@ Figures use a shared clean theme and restrained palette from `scripts/analysis_c
 ### Long-table input example
 
 ```tsv
-sample_id	marker	domain	rank	lineage	taxon_marker_reads	clean_reads_total	marker_rpm	marker_rpkm
-S1	16S	Bacteria	genus	Bacteria;p__Pseudomonadota;g__Vibrio	20	1000000	20	0.13
+sample_id	marker	domain	euk_group	rank	lineage	rank_lineage	taxon_marker_reads	clean_reads_total	marker_rpm	marker_rpkm
+S1	16S	Bacteria	NA	genus	d__Bacteria;p__Pseudomonadota;c__Gammaproteobacteria;o__Vibrionales;f__Vibrionaceae;g__Vibrio	Vibrio	20	1000000	20	0.13
 ```
 
 ### Example: taxa time-space analysis

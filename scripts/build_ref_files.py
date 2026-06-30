@@ -5,7 +5,7 @@ This script prepares reference files for metamarker profiling workflows:
 
   * SILVA SSURef -> DNA FASTA split into arc/bac 16S and eukaryotic 18S
   * UNITE ITS    -> short-id ITS FASTA
-  * taxonomy TSV -> ref_id, marker, domain, phylum, class, order, family, genus, species
+  * taxonomy TSV -> ref_id, marker, domain, euk_group, phylum, class, order, family, genus, species
   * minimap2 indexes, optionally built in parallel
 
 Features:
@@ -53,6 +53,7 @@ from rich_argparse import RichHelpFormatter
 
 PROGRAM = "build_ref_files.py"
 MISSING = "Unclassified"
+NA_GROUP = "NA"
 DEFAULT_REF_CONFIG = Path.home() / ".config" / "metamarker_profile" / "ref_dir"
 
 
@@ -81,6 +82,7 @@ TAX_HEADER = [
     "ref_id",
     "marker",
     "domain",
+    "euk_group",
     "phylum",
     "class",
     "order",
@@ -90,6 +92,23 @@ TAX_HEADER = [
 ]
 
 RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
+EUK_GROUPS = [
+    "Fungi",
+    "Metazoa",
+    "Viridiplantae",
+    "Rhodophyta",
+    "Glaucophyta",
+    "Alveolata",
+    "Stramenopiles",
+    "Rhizaria",
+    "Amoebozoa",
+    "Excavata",
+    "Haptista",
+    "Cryptista",
+    "Apusozoa",
+    "Choanoflagellida",
+    "Opisthokonta",
+]
 
 PREFIX_RANK = {
     "d": "domain",
@@ -128,6 +147,7 @@ NAME_RANK = {
 @dataclass(frozen=True)
 class Taxonomy:
     domain: str = MISSING
+    euk_group: str = NA_GROUP
     phylum: str = MISSING
     klass: str = MISSING
     order: str = MISSING
@@ -135,9 +155,21 @@ class Taxonomy:
     genus: str = MISSING
     species: str = MISSING
 
+    def rank_values(self) -> list[str]:
+        return [
+            self.domain,
+            self.phylum,
+            self.klass,
+            self.order,
+            self.family,
+            self.genus,
+            self.species,
+        ]
+
     def values(self) -> list[str]:
         return [
             self.domain,
+            self.euk_group,
             self.phylum,
             self.klass,
             self.order,
@@ -566,9 +598,11 @@ def parse_taxonomy(header: str, default_domain: str = MISSING) -> Taxonomy:
 
     if values["domain"] == MISSING and default_domain != MISSING:
         values["domain"] = default_domain
+    values["euk_group"] = infer_euk_group_from_values(values)
 
     return Taxonomy(
         domain=values["domain"],
+        euk_group=values["euk_group"],
         phylum=values["phylum"],
         klass=values["class"],
         order=values["order"],
@@ -581,6 +615,7 @@ def parse_taxonomy(header: str, default_domain: str = MISSING) -> Taxonomy:
 def taxonomy_from_values(values: dict[str, str]) -> Taxonomy:
     return Taxonomy(
         domain=values.get("domain", MISSING),
+        euk_group=values.get("euk_group", infer_euk_group_from_values(values)),
         phylum=values.get("phylum", MISSING),
         klass=values.get("class", MISSING),
         order=values.get("order", MISSING),
@@ -594,6 +629,42 @@ def domain_key(domain: str) -> str:
     return domain.lower().replace("_", "").replace(" ", "")
 
 
+def euk_group_key(value: str) -> str:
+    return value.lower().replace("_", "").replace(" ", "")
+
+
+def infer_euk_group_from_values(values: dict[str, str], raw_parts: list[str] | None = None) -> str:
+    domain = values.get("domain", MISSING)
+    dkey = domain_key(domain)
+    if dkey == "fungi":
+        return "Fungi"
+    if dkey != "eukaryota":
+        return NA_GROUP
+
+    parts = raw_parts if raw_parts is not None else [values.get(rank, MISSING) for rank in RANKS]
+    keyed_parts = {euk_group_key(part) for part in parts}
+    for group in EUK_GROUPS:
+        if euk_group_key(group) in keyed_parts:
+            return group
+    for part in parts[1:]:
+        if part and part != MISSING:
+            return part
+    return MISSING
+
+
+def taxonomy_with_euk_group(tax: Taxonomy, euk_group: str) -> Taxonomy:
+    return Taxonomy(
+        domain=tax.domain,
+        euk_group=euk_group,
+        phylum=tax.phylum,
+        klass=tax.klass,
+        order=tax.order,
+        family=tax.family,
+        genus=tax.genus,
+        species=tax.species,
+    )
+
+
 def parse_silva_taxonomy(header: str) -> Taxonomy:
     raw_parts = taxonomy_parts(header)
     parts = [clean_taxon(part) for part in raw_parts]
@@ -603,10 +674,12 @@ def parse_silva_taxonomy(header: str) -> Taxonomy:
     dkey = domain_key(parts[0])
     values = {rank: MISSING for rank in RANKS}
     values["domain"] = parts[0]
+    values["euk_group"] = infer_euk_group_from_values(values, parts)
 
     if dkey in {"bacteria", "archaea"}:
         for rank, value in zip(RANKS, parts):
             values[rank] = value
+        values["euk_group"] = NA_GROUP
         return taxonomy_from_values(values)
 
     if dkey == "eukaryota":
@@ -619,6 +692,7 @@ def parse_silva_taxonomy(header: str) -> Taxonomy:
             values["species"] = lineage[-1]
         elif len(lineage) == 1:
             values["species"] = lineage[0]
+        values["euk_group"] = infer_euk_group_from_values(values, parts)
         return taxonomy_from_values(values)
 
     return parse_taxonomy(header)
@@ -669,7 +743,8 @@ def add_unite_sh_suffix_to_taxonomy(
     if not sh_id:
         return tax
 
-    values = dict(zip(RANKS, tax.values(), strict=True))
+    values = dict(zip(RANKS, tax.rank_values(), strict=True))
+    values["euk_group"] = tax.euk_group
     for rank in ranks_to_suffix:
         if rank == "domain":
             continue
@@ -715,6 +790,7 @@ def prepare_unite_record(
             extract_unite_sh_id(header),
             sh_suffix_ranks,
         )
+    tax = taxonomy_with_euk_group(tax, "Fungi")
     record = RefTaxonomy(ref_id=ref_id, marker="ITS", taxonomy=tax)
     return PreparedRecord(target="unite", record=record, sequence=normalize_sequence(seq))
 

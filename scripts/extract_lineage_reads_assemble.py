@@ -52,12 +52,22 @@ from rich_argparse import RawDescriptionRichHelpFormatter
 
 RANKS = ["domain", "phylum", "class", "order", "family", "genus", "species"]
 MARKER_ORDER = ["16S", "18S", "ITS"]
+NA_GROUP = "NA"
+RANK_PREFIX = {
+    "domain": "d__",
+    "phylum": "p__",
+    "class": "c__",
+    "order": "o__",
+    "family": "f__",
+    "genus": "g__",
+    "species": "s__",
+}
 DEFAULT_MIN_IDENTITY = {"16S": 0.97, "18S": 0.97, "ITS": 0.95}
 DEFAULT_MIN_ALN_LEN = {"16S": 80, "18S": 80, "ITS": 80}
 DEFAULT_MIN_QCOV = {"16S": 0.60, "18S": 0.60, "ITS": 0.60}
 DEFAULT_MIN_MAPQ = 0
 DEFAULT_OUTDIR = "metamarker_profile_out"
-DEFAULT_RANK = "genus"
+DEFAULT_RANK = "species"
 DEFAULT_MODE = "assigned"
 DEFAULT_MATCH = "exact"
 DEFAULT_ASSEMBLER = "miniasm"
@@ -103,8 +113,12 @@ class SelectedRead:
     identity: float
     aln_len: int
     mapq: int
+    mate_euk_group: str
     mate_lineage: str
+    mate_full_lineage: str
+    assigned_euk_group: str
     assigned_lineage: str
+    assigned_full_lineage: str
     assigned_target_id: str
     read_weight: int
 
@@ -334,7 +348,7 @@ def load_taxonomy(path: Path) -> Dict[str, Dict[str, str]]:
     tax: Dict[str, Dict[str, str]] = {}
     with open(path, "r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
-        required = {"ref_id", "marker", *RANKS}
+        required = {"ref_id", "marker", "euk_group", *RANKS}
         missing = required - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"Taxonomy table missing columns: {','.join(sorted(missing))}")
@@ -343,6 +357,9 @@ def load_taxonomy(path: Path) -> Dict[str, Dict[str, str]]:
             if not ref_id:
                 continue
             rec = {k: (row.get(k) or "").strip() for k in ["marker", *RANKS]}
+            rec["euk_group"] = (row.get("euk_group") or "").strip()
+            if not rec["euk_group"]:
+                raise ValueError(f"Taxonomy table has empty euk_group for ref_id={ref_id}. Rebuild refs with scripts/build_ref_files.py.")
             if not rec["domain"]:
                 rec["domain"] = "NA"
             for rank in RANKS:
@@ -500,6 +517,22 @@ def build_matcher(lineage: str, match_mode: str, ignore_case: bool) -> Callable[
     return lambda value: ((value or "").lower() if ignore_case else (value or "")) == target
 
 
+def lineage_ranks(rank: str) -> List[str]:
+    return RANKS[: RANKS.index(rank) + 1]
+
+
+def full_lineage(taxonomy: Dict[str, str], rank: str) -> str:
+    parts = []
+    for lineage_rank in lineage_ranks(rank):
+        default_value = "NA" if lineage_rank == "domain" else "unidentified"
+        parts.append(f"{RANK_PREFIX[lineage_rank]}{taxonomy.get(lineage_rank) or default_value}")
+    return ";".join(parts)
+
+
+def matches_lineage(hit: Hit, rank: str, lineage_match: Callable[[str], bool]) -> bool:
+    return lineage_match(hit.taxonomy.get(rank, "unidentified")) or lineage_match(full_lineage(hit.taxonomy, rank))
+
+
 def select_reads(
     hits: Dict[Tuple[str, str], Hit],
     rank: str,
@@ -514,7 +547,8 @@ def select_reads(
     if mode == "mate-hit":
         for hit in hits.values():
             mate_lineage = hit.taxonomy.get(rank, "unidentified")
-            if not lineage_match(mate_lineage):
+            mate_full_lineage = full_lineage(hit.taxonomy, rank)
+            if not matches_lineage(hit, rank, lineage_match):
                 continue
             selected.append(
                 SelectedRead(
@@ -527,8 +561,12 @@ def select_reads(
                     identity=hit.identity,
                     aln_len=hit.aln_len,
                     mapq=hit.mapq,
+                    mate_euk_group=hit.taxonomy.get("euk_group", NA_GROUP),
                     mate_lineage=mate_lineage,
+                    mate_full_lineage=mate_full_lineage,
+                    assigned_euk_group=hit.taxonomy.get("euk_group", NA_GROUP),
                     assigned_lineage=mate_lineage,
+                    assigned_full_lineage=mate_full_lineage,
                     assigned_target_id=hit.target_id,
                     read_weight=1,
                 )
@@ -543,10 +581,12 @@ def select_reads(
         if winner is None:
             continue
         assigned_lineage = winner.taxonomy.get(rank, "unidentified")
-        if not lineage_match(assigned_lineage):
+        assigned_full_lineage = full_lineage(winner.taxonomy, rank)
+        if not matches_lineage(winner, rank, lineage_match):
             continue
         read_weight = len(pair_hits)
         for hit in pair_hits:
+            mate_full_lineage = full_lineage(hit.taxonomy, rank)
             selected.append(
                 SelectedRead(
                     sample_id=hit.sample_id,
@@ -558,8 +598,12 @@ def select_reads(
                     identity=hit.identity,
                     aln_len=hit.aln_len,
                     mapq=hit.mapq,
+                    mate_euk_group=hit.taxonomy.get("euk_group", NA_GROUP),
                     mate_lineage=hit.taxonomy.get(rank, "unidentified"),
+                    mate_full_lineage=mate_full_lineage,
+                    assigned_euk_group=winner.taxonomy.get("euk_group", NA_GROUP),
                     assigned_lineage=assigned_lineage,
+                    assigned_full_lineage=assigned_full_lineage,
                     assigned_target_id=winner.target_id,
                     read_weight=read_weight,
                 )
@@ -712,8 +756,12 @@ def write_selected_table(path: Path, selected: Sequence[SelectedRead]) -> None:
                 "identity",
                 "aln_len",
                 "mapq",
+                "mate_euk_group",
                 "mate_lineage",
+                "mate_full_lineage",
+                "assigned_euk_group",
                 "assigned_lineage",
+                "assigned_full_lineage",
                 "assigned_target_id",
                 "read_weight",
             ]
@@ -730,8 +778,12 @@ def write_selected_table(path: Path, selected: Sequence[SelectedRead]) -> None:
                     f"{r.identity:.6f}",
                     r.aln_len,
                     r.mapq,
+                    r.mate_euk_group,
                     r.mate_lineage,
+                    r.mate_full_lineage,
+                    r.assigned_euk_group,
                     r.assigned_lineage,
+                    r.assigned_full_lineage,
                     r.assigned_target_id,
                     r.read_weight,
                 ]
@@ -1043,7 +1095,9 @@ def input_help_text() -> str:
        The taxonomy TSV is read from run_config.tsv unless --taxonomy is set.
        Required taxonomy columns:
 
-         ref_id marker domain phylum class order family genus species
+         ref_id marker domain euk_group phylum class order family genus species
+
+       euk_group is metadata for eukaryotic group separation, not a rank.
 
        PAF query IDs must end in /1 or /2. The script strips that mate suffix
        and pairs mates by normalized read ID.
@@ -1061,6 +1115,9 @@ def input_help_text() -> str:
 
       --rank controls which taxonomy column is matched.
       --lineage is matched exactly by default.
+      It can be either the short value at --rank, such as Vibrio,
+      or the complete lineage path through --rank, such as:
+        d__Bacteria;p__Pseudomonadota;c__Gammaproteobacteria;o__Vibrionales;f__Vibrionaceae;g__Vibrio
       --match contains or --match regex can be used for broader matching.
 
     [bold green]Selection modes[/bold green]
